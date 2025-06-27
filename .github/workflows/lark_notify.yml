@@ -1,0 +1,79 @@
+name: GitHub to Lark Notification
+
+on:
+  pull_request:
+    types: [opened, reopened, closed, synchronize]
+  push:
+    branches:
+      - main
+  issues:
+    types: [opened, closed]
+  pull_request_review:
+    types: [submitted]
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify to Lark
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          ACTION="${{ github.event.action }}"
+          STATUS="${{ github.event.workflow_run.conclusion }}"
+          REPO="${{ github.repository }}"
+          URL=""
+          MESSAGE=""
+
+          if [ "$EVENT_NAME" == "pull_request" ]; then
+            TITLE="${{ github.event.pull_request.title }}"
+            URL="${{ github.event.pull_request.html_url }}"
+            USER="${{ github.event.pull_request.user.login }}"
+            MESSAGE="🔔 PR ${ACTION}: [${TITLE}](${URL}) by ${USER}"
+
+          elif [ "$EVENT_NAME" == "push" ]; then
+            COMMIT_MSG="${{ github.head_commit.message }}"
+            URL="https://github.com/${REPO}/commit/${{ github.sha }}"
+            USER="${{ github.head_commit.committer.name }}"
+            MESSAGE="🚀 Push by ${USER}: ${COMMIT_MSG}\n👉 ${URL}"
+
+          elif [ "$EVENT_NAME" == "issues" ]; then
+            TITLE="${{ github.event.issue.title }}"
+            URL="${{ github.event.issue.html_url }}"
+            USER="${{ github.event.issue.user.login }}"
+            MESSAGE="📌 Issue ${ACTION}: [${TITLE}](${URL}) by ${USER}"
+
+          elif [ "$EVENT_NAME" == "pull_request_review" ]; then
+            STATE="${{ github.event.review.state }}"
+            PR_TITLE="${{ github.event.pull_request.title }}"
+            PR_URL="${{ github.event.pull_request.html_url }}"
+            REVIEWER="${{ github.event.review.user.login }}"
+            MESSAGE="📝 PR Review (${STATE}): [${PR_TITLE}](${PR_URL}) by ${REVIEWER}"
+
+          elif [ "$EVENT_NAME" == "workflow_run" ]; then
+            WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+            URL="${{ github.event.workflow_run.html_url }}"
+            if [ "$STATUS" == "success" ]; then
+              ICON="✅"
+            else
+              ICON="❌"
+            fi
+            MESSAGE="${ICON} CI '${WORKFLOW_NAME}' ${STATUS} for ${REPO}\n👉 ${URL}"
+
+          else
+            MESSAGE="📢 Event: ${EVENT_NAME} - ${ACTION}"
+          fi
+
+          echo "Send message: ${MESSAGE}"
+
+          curl -X POST "${{ secrets.LARK_WEBHOOK }}" \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "msg_type": "text",
+            "content": {
+              "text": "'"${MESSAGE}"'"
+            }
+          }'
