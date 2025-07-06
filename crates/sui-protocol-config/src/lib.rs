@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 86;
+const MAX_PROTOCOL_VERSION: u64 = 87;
 
 // Record history of protocol version allocations here:
 //
@@ -245,6 +245,8 @@ const MAX_PROTOCOL_VERSION: u64 = 86;
 // Version 86: Use type tags in the object runtime and adapter instead of `Type`s.
 //             Make variant count limit explicit in protocol config.
 //             Enable party transfer in testnet.
+// Version 87: Update `sui-system` package to use `calculate_rewards` function.
+//             Define the cost for the native Move function `rgp`.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -1225,6 +1227,7 @@ pub struct ProtocolConfig {
     tx_context_epoch_cost_base: Option<u64>,
     tx_context_epoch_timestamp_ms_cost_base: Option<u64>,
     tx_context_sponsor_cost_base: Option<u64>,
+    tx_context_rgp_cost_base: Option<u64>,
     tx_context_gas_price_cost_base: Option<u64>,
     tx_context_gas_budget_cost_base: Option<u64>,
     tx_context_ids_created_cost_base: Option<u64>,
@@ -1916,12 +1919,7 @@ impl ProtocolConfig {
     }
 
     pub fn gc_depth(&self) -> u32 {
-        if cfg!(msim) {
-            // exercise a very low gc_depth
-            5
-        } else {
-            self.consensus_gc_depth.unwrap_or(0)
-        }
+        self.consensus_gc_depth.unwrap_or(0)
     }
 
     pub fn mysticeti_fastpath(&self) -> bool {
@@ -2370,6 +2368,7 @@ impl ProtocolConfig {
             tx_context_epoch_cost_base: None,
             tx_context_epoch_timestamp_ms_cost_base: None,
             tx_context_sponsor_cost_base: None,
+            tx_context_rgp_cost_base: None,
             tx_context_gas_price_cost_base: None,
             tx_context_gas_budget_cost_base: None,
             tx_context_ids_created_cost_base: None,
@@ -3759,6 +3758,9 @@ impl ProtocolConfig {
                         cfg.feature_flags.enable_party_transfer = true;
                     }
                 }
+                87 => {
+                    cfg.tx_context_rgp_cost_base = Some(30);
+                }
                 // Use this template when making changes:
                 //
                 //     // modify an existing constant.
@@ -3772,6 +3774,12 @@ impl ProtocolConfig {
                 _ => panic!("unsupported version {:?}", version),
             }
         }
+
+        // Simtest specific overrides.
+        if cfg!(msim) {
+            cfg.consensus_gc_depth = Some(5);
+        }
+
         cfg
     }
 
@@ -3959,6 +3967,10 @@ impl ProtocolConfig {
             aliased,
             allowed_tx_digests,
         });
+    }
+
+    pub fn set_enable_accumulators_for_testing(&mut self, val: bool) {
+        self.feature_flags.enable_accumulators = val;
     }
 }
 

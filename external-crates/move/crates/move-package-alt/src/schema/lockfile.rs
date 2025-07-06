@@ -6,12 +6,12 @@ use toml_edit::{
     visit_mut::{self, VisitMut},
 };
 
-use crate::{flavor::MoveFlavor, git::GitSha};
+use crate::flavor::MoveFlavor;
 
 use super::{
-    EnvironmentID, EnvironmentName, LocalDepInfo, OnChainDepInfo, PackageName, shared::ser_account,
+    EnvironmentID, EnvironmentName, GitSha, LocalDepInfo, OnChainDepInfo, OriginalID, PackageName,
+    PublishedID,
 };
-use move_core_types::account_address::AccountAddress;
 
 /// An identifier for a node in the package graph, used to index into the
 /// `[pinned.<environment>]` table
@@ -37,10 +37,8 @@ pub type BuildConfig = toml::Value;
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub struct Publication<F: MoveFlavor> {
-    #[serde(serialize_with = "ser_account")]
-    pub published_at: AccountAddress,
-    #[serde(serialize_with = "ser_account")]
-    pub original_id: AccountAddress,
+    pub published_at: PublishedID,
+    pub original_id: OriginalID,
     pub chain_id: EnvironmentID,
     pub toolchain_version: String,
     pub build_config: BuildConfig,

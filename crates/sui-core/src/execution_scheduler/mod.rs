@@ -7,6 +7,7 @@ use crate::{
         shared_object_version_manager::Schedulable, AuthorityMetrics, ExecutionEnv,
     },
     execution_cache::{ObjectCacheRead, TransactionCacheRead},
+    execution_scheduler::balance_withdraw_scheduler::BalanceSettlement,
 };
 use enum_dispatch::enum_dispatch;
 use execution_scheduler_impl::ExecutionScheduler;
@@ -77,6 +78,8 @@ pub trait ExecutionSchedulerAPI {
         epoch_store: &Arc<AuthorityPerEpochStore>,
     );
 
+    fn settle_balances(&self, settlement: BalanceSettlement);
+
     fn check_execution_overload(
         &self,
         overload_config: &AuthorityOverloadConfig,
@@ -103,7 +106,7 @@ impl ExecutionSchedulerWrapper {
         transaction_cache_read: Arc<dyn TransactionCacheRead>,
         tx_ready_certificates: UnboundedSender<PendingCertificate>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
-        is_fullnode: bool,
+        _is_fullnode: bool,
         metrics: Arc<AuthorityMetrics>,
     ) -> Self {
         // If Mysticeti fastpath is enabled, we must use ExecutionScheduler.
@@ -124,13 +127,15 @@ impl ExecutionSchedulerWrapper {
             rand::thread_rng().gen_bool(0.5)
         } else {
             let chain = epoch_store.get_chain_identifier().chain();
-            chain == Chain::Unknown || (chain == Chain::Testnet && is_fullnode)
+            chain != Chain::Mainnet
         };
         if enable_execution_scheduler {
+            let enable_accumulators = epoch_store.accumulators_enabled();
             Self::ExecutionScheduler(ExecutionScheduler::new(
                 object_cache_read,
                 transaction_cache_read,
                 tx_ready_certificates,
+                enable_accumulators,
                 metrics,
             ))
         } else {
