@@ -9,6 +9,24 @@
 
 [Sui](https://sui.io) is a next-generation smart contract platform with high throughput, low latency, and an asset-oriented programming model powered by the [Move programming language](https://github.com/MystenLabs/awesome-move).
 
+## Fork Setup
+
+**First-time setup after cloning this fork:**
+```bash
+# Set up workflow skip-worktree settings
+./.github/manage-workflows.sh set
+
+# Add upstream remote
+git remote add upstream https://github.com/MystenLabs/sui.git
+```
+
+**To sync with upstream:**
+```bash
+git pull upstream main
+```
+
+This preserves custom workflows (like Lark notifications) and keeps certain upstream workflows deleted automatically.
+
 ## Sui Highlights
 
 Sui offers the following benefits and capabilities:
