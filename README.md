@@ -9,6 +9,53 @@
 
 [Sui](https://sui.io) is a next-generation smart contract platform with high throughput, low latency, and an asset-oriented programming model powered by the [Move programming language](https://github.com/MystenLabs/awesome-move).
 
+## Fork Setup
+
+**First-time setup after cloning this fork:**
+```bash
+# Add upstream remote
+git remote add upstream https://github.com/MystenLabs/sui.git
+
+# Set up automatic protection against upstream .github/ changes
+./scripts/manage-workflows.sh auto-protect
+```
+
+**To sync with upstream:**
+```bash
+git pull upstream main
+# .github/ protection will automatically activate after pull/merge
+```
+
+This completely protects the .github/ directory from upstream changes, preserving all custom workflows and configurations (like Lark notifications).
+
+## .github/ Protection Commands
+
+**`./scripts/manage-workflows.sh auto-protect`** (Recommended)
+- Sets up automatic protection with git hooks
+- Compares with upstream and protects all `.github/` differences
+- Automatically runs after every pull/merge operation
+- One-time setup for permanent protection
+
+**`./scripts/manage-workflows.sh protect-upstream`**
+- Manually compare with upstream MystenLabs/sui repository
+- Protects existing files from updates
+- Prevents new upstream files from being added
+- Creates dummy files for upstream files that don't exist locally
+
+**`./scripts/manage-workflows.sh set`**
+- Basic protection for current `.github/` files
+- Sets skip-worktree for all existing files in `.github/`
+- Does not protect against new upstream files
+
+**Other commands:**
+```bash
+# Remove all protection (use with caution)
+./scripts/manage-workflows.sh unset
+
+# List all protected files
+./scripts/manage-workflows.sh list
+```
+
 ## Sui Highlights
 
 Sui offers the following benefits and capabilities:
