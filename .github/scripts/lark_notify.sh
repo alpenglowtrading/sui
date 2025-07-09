@@ -279,9 +279,18 @@ send_all_passed_notification() {
   echo "🚀 Sending 'All Tests Passed' notification to Lark..."
   echo "$card_json" | jq -C '.'
   
-  # Send notification
+  # Send notification with signature if secret is provided
+  CURRENT_TIMESTAMP=$(date +%s)
+  
+  if [ -n "${LARK_SECRET:-}" ]; then
+    SIGNATURE=$(generate_signature "$card_json" "$LARK_SECRET" "$CURRENT_TIMESTAMP")
+    CURL_HEADERS=(-H 'Content-Type: application/json' -H "X-Lark-Request-Timestamp: $CURRENT_TIMESTAMP" -H "X-Lark-Request-Nonce: $(uuidgen)" -H "X-Lark-Signature: $SIGNATURE")
+  else
+    CURL_HEADERS=(-H 'Content-Type: application/json')
+  fi
+  
   if curl -X POST "$LARK_WEBHOOK" \
-    -H 'Content-Type: application/json' \
+    "${CURL_HEADERS[@]}" \
     -d "$card_json" \
     --fail-with-body \
     --max-time 30 \
@@ -486,13 +495,40 @@ fi
 echo "🚀 Sending notification to Lark..."
 echo "$CARD_JSON" | jq -C '.'
 
+# Function to generate signature
+generate_signature() {
+  local payload="$1"
+  local secret="$2"
+  local timestamp="$3"
+  
+  if [ -n "$secret" ]; then
+    # Create signature string: timestamp + payload
+    local sign_string="${timestamp}${payload}"
+    # Generate HMAC-SHA256 signature
+    echo -n "$sign_string" | openssl dgst -sha256 -hmac "$secret" -binary | base64
+  else
+    echo ""
+  fi
+}
+
 # Send notification with retry logic
 RETRY_COUNT=0
 MAX_RETRIES=3
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  # Generate timestamp for signature
+  CURRENT_TIMESTAMP=$(date +%s)
+  
+  # Generate signature if secret is provided
+  if [ -n "${LARK_SECRET:-}" ]; then
+    SIGNATURE=$(generate_signature "$CARD_JSON" "$LARK_SECRET" "$CURRENT_TIMESTAMP")
+    CURL_HEADERS=(-H 'Content-Type: application/json' -H "X-Lark-Request-Timestamp: $CURRENT_TIMESTAMP" -H "X-Lark-Request-Nonce: $(uuidgen)" -H "X-Lark-Signature: $SIGNATURE")
+  else
+    CURL_HEADERS=(-H 'Content-Type: application/json')
+  fi
+  
   if curl -X POST "$LARK_WEBHOOK" \
-    -H 'Content-Type: application/json' \
+    "${CURL_HEADERS[@]}" \
     -d "$CARD_JSON" \
     --fail-with-body \
     --max-time 30 \
