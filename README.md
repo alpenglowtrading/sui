@@ -28,7 +28,7 @@ git pull upstream main
 
 This completely protects the .github/ directory and README.md from upstream changes, preserving all custom workflows and configurations (like Lark notifications).
 
-## .github/ Protection Commands
+## Protection Commands
 
 **`./scripts/manage-workflows.sh auto-protect`** (Recommended)
 - Sets up automatic protection with git hooks

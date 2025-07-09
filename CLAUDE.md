@@ -5,9 +5,10 @@
 - Lark notification script: `.github/scripts/lark_notify.sh`
 
 ## Recent Work Done
-- Fixed missing `check_all_workflows_complete` function in lark_notify.sh:343
-- Removed unnecessary comment about workflow completion logic
-- Cleaned up workflow completion handling for success/cancelled/skipped/neutral statuses
+- **FIXED LARK SIGNATURE ISSUE** - Error 19021 "sign match fail" resolved
+- Updated signature generation (lark_notify.sh:204): Use `printf "%s\n%s"` for real newline
+- Changed timestamp format (lark_notify.sh:27): Unix timestamp `date +%s` not ISO format
+- Lark notifications now working: HTTP 200 with success response
 
 ## Key Patterns
 - Workflow notification failures usually in lark_notify.sh

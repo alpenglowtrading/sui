@@ -24,7 +24,7 @@ REPO="${GITHUB_EVENT_REPO:-}"
 REPO_NAME="${GITHUB_EVENT_REPO_NAME:-}"
 REPO_OWNER="${GITHUB_EVENT_REPO_OWNER:-}"
 ACTOR="${GITHUB_EVENT_ACTOR:-}"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+TIMESTAMP=$(date +%s)
 
 # Function to escape JSON strings
 escape_json() {
@@ -50,8 +50,42 @@ create_notification_card() {
   local template_color="$2"
   local elements="$3"
   local timestamp="$4"
+  local signature="$5"
   
-  cat << EOF
+  # Create base card structure
+  local card_json
+  if [ -n "$signature" ]; then
+    # With signature verification
+    card_json=$(cat << EOF
+{
+  "timestamp": "${timestamp}",
+  "sign": "${signature}",
+  "msg_type": "interactive",
+  "card": {
+    "config": {
+      "wide_screen_mode": true,
+      "enable_forward": true
+    },
+    "header": {
+      "title": {
+        "tag": "plain_text",
+        "content": "${event_type}"
+      },
+      "template": "${template_color}",
+      "ud_icon": {
+        "token": "img_v2_041b28e3-5680-48c2-9af2-497ace79333g"
+      }
+    },
+    "elements": [
+      ${elements}
+    ]
+  }
+}
+EOF
+)
+  else
+    # Without signature verification
+    card_json=$(cat << EOF
 {
   "msg_type": "interactive",
   "card": {
@@ -72,10 +106,13 @@ create_notification_card() {
     "elements": [
       ${elements}
     ]
-  },
-  "timestamp": "${timestamp}"
+  }
 }
 EOF
+)
+  fi
+  
+  echo "$card_json"
 }
 
 # Function to create standard button action
@@ -157,6 +194,22 @@ create_content_div() {
 EOF
 }
 
+# Function to generate signature for Lark webhook verification
+generate_signature() {
+  local secret="$1"
+  local timestamp="$2"
+  
+  if [ -n "$secret" ]; then
+    # Create signature string: timestamp + real newline + secret (Lark standard format)
+    local sign_string=$(printf "%s\n%s" "$timestamp" "$secret")
+    # Generate HMAC-SHA256 signature using the sign_string as key with empty data (per Lark documentation)
+    local signature=$(printf "" | openssl dgst -sha256 -hmac "$sign_string" -binary | base64)
+    echo "${signature}"
+  else
+    echo ""
+  fi
+}
+
 # Function to get workflow run details
 get_workflow_run_details() {
   local run_id="$1"
@@ -172,134 +225,6 @@ get_workflow_run_details() {
   fi
   
   echo "$jobs_response"
-}
-
-# Function to check if all workflows for a commit are complete
-check_all_workflows_complete() {
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "No GITHUB_TOKEN available, cannot check workflow completion status"
-    return
-  fi
-  
-  # Check if we've already sent notification for this commit
-  local notification_file="/tmp/lark_notify_${COMMIT_SHA}_sent"
-  if [ -f "$notification_file" ]; then
-    echo "Already sent notification for commit ${COMMIT_SHA}, skipping"
-    return
-  fi
-  
-  # Get ALL workflow runs for this commit (remove event filter to get all workflows)
-  local runs_response
-  runs_response=$(curl -s -f \
-    -H "Authorization: token ${GITHUB_TOKEN}" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/actions/runs?head_sha=${COMMIT_SHA}" 2>/dev/null || echo '{"workflow_runs":[]}')
-  
-  # Check if all expected workflows are complete and get their statuses
-  local all_complete="true"
-  local has_failure="false"
-  local completed_workflows=""
-  local total_expected_workflows=${#EXPECTED_WORKFLOWS[@]}
-  local completed_count=0
-  
-  # Track unique workflow names to avoid double counting
-  declare -A workflow_status
-  declare -A workflow_conclusion
-  
-  # Parse workflow runs using jq and filter by expected workflows
-  while IFS='|' read -r name status conclusion; do
-    if [ -n "$name" ]; then
-      # Check if this workflow is in the expected list
-      local is_expected="false"
-      for expected in "${EXPECTED_WORKFLOWS[@]}"; do
-        if [ "$name" = "$expected" ]; then
-          is_expected="true"
-          break
-        fi
-      done
-      
-      if [ "$is_expected" = "true" ]; then
-        # Only update if we don't have this workflow or if this run is more recent
-        if [ -z "${workflow_status[$name]:-}" ] || [ "$status" = "completed" ]; then
-          workflow_status[$name]="$status"
-          workflow_conclusion[$name]="$conclusion"
-        fi
-      fi
-    fi
-  done < <(echo "$runs_response" | jq -r '.workflow_runs[] | "\(.name)|\(.status)|\(.conclusion // "unknown")"' 2>/dev/null || true)
-  
-  # Now count unique workflows
-  for workflow_name in "${EXPECTED_WORKFLOWS[@]}"; do
-    if [ -n "${workflow_status[$workflow_name]:-}" ]; then
-      if [ "${workflow_status[$workflow_name]}" = "completed" ]; then
-        completed_count=$((completed_count + 1))
-        completed_workflows="${completed_workflows}• $workflow_name: ${workflow_conclusion[$workflow_name]:-unknown}\n"
-        if [ "${workflow_conclusion[$workflow_name]:-}" = "failure" ]; then
-          has_failure="true"
-        fi
-      else
-        all_complete="false"
-      fi
-    else
-      all_complete="false"
-    fi
-  done
-  
-  echo "Status check: ${completed_count}/${total_expected_workflows} expected workflows complete, has_failure=${has_failure}, all_complete=${all_complete}"
-  
-  # Only send success notification if ALL expected workflows are complete and no failures
-  if [ "$all_complete" = "true" ] && [ "$has_failure" = "false" ] && [ "$completed_count" -eq "$total_expected_workflows" ]; then
-    # Create flag file to prevent duplicate notifications
-    echo "$(date)" > "$notification_file"
-    send_all_passed_notification
-  fi
-}
-
-# Function to send "all passed" notification
-send_all_passed_notification() {
-  local event_type="✅ All Tests Passed"
-  local template_color="green"
-  
-  local content_div=$(create_content_div "All workflows completed successfully on **${BRANCH}**")
-  local divider=$(create_divider)
-  
-  local field1=$(create_field "👤 Triggered by" "@${WORKFLOW_ACTOR}" true)
-  local field2=$(create_field "🌿 Branch" "${BRANCH}" true)
-  local field3=$(create_field "📝 Commit" "${SHORT_SHA}" true)
-  local field4=$(create_field "📦 Repository" "${REPO_NAME}" true)
-  local field_layout=$(create_field_layout "${field1}, ${field2}, ${field3}, ${field4}")
-  
-  local button1=$(create_button "📝 View Commit" "https://github.com/${REPO}/commit/${COMMIT_SHA}" "primary")
-  local button2=$(create_button "🌲 View Branch" "https://github.com/${REPO}/tree/${BRANCH}" "default")
-  local button_action=$(create_button_action "${button1}, ${button2}")
-  
-  local elements="${content_div}, ${divider}, ${field_layout}, ${button_action}"
-  local card_json=$(create_notification_card "$event_type" "$template_color" "$elements" "$TIMESTAMP")
-  
-  echo "🚀 Sending 'All Tests Passed' notification to Lark..."
-  echo "$card_json" | jq -C '.'
-  
-  # Send notification with signature if secret is provided
-  CURRENT_TIMESTAMP=$(date +%s)
-  
-  if [ -n "${LARK_SECRET:-}" ]; then
-    SIGNATURE=$(generate_signature "$card_json" "$LARK_SECRET" "$CURRENT_TIMESTAMP")
-    CURL_HEADERS=(-H 'Content-Type: application/json' -H "X-Lark-Request-Timestamp: $CURRENT_TIMESTAMP" -H "X-Lark-Request-Nonce: $(uuidgen)" -H "X-Lark-Signature: $SIGNATURE")
-  else
-    CURL_HEADERS=(-H 'Content-Type: application/json')
-  fi
-  
-  if curl -X POST "$LARK_WEBHOOK" \
-    "${CURL_HEADERS[@]}" \
-    -d "$card_json" \
-    --fail-with-body \
-    --max-time 30 \
-    --silent \
-    --show-error; then
-    echo "✅ All passed notification sent successfully"
-  else
-    echo "❌ Failed to send all passed notification"
-  fi
 }
 
 # Main notification logic
@@ -370,7 +295,12 @@ case "$EVENT_NAME" in
     BUTTON_ACTION=$(create_button_action "${BUTTON1}, ${BUTTON2}")
     
     ELEMENTS="${CONTENT_DIV}, ${DIVIDER}, ${FIELD_LAYOUT}, ${BUTTON_ACTION}"
-    CARD_JSON=$(create_notification_card "$EVENT_TYPE" "$TEMPLATE_COLOR" "$ELEMENTS" "$TIMESTAMP")
+    # Generate signature if secret is available
+    SIGNATURE=""
+    if [ -n "${LARK_SECRET:-}" ]; then
+      SIGNATURE=$(generate_signature "$LARK_SECRET" "$TIMESTAMP")
+    fi
+    CARD_JSON=$(create_notification_card "$EVENT_TYPE" "$TEMPLATE_COLOR" "$ELEMENTS" "$TIMESTAMP" "$SIGNATURE")
     ;;
     
   "push")
@@ -418,7 +348,12 @@ case "$EVENT_NAME" in
     BUTTON_ACTION=$(create_button_action "${BUTTON1}, ${BUTTON2}")
     
     ELEMENTS="${CONTENT_DIV}, ${DIVIDER}, ${FIELD_LAYOUT}, ${BUTTON_ACTION}"
-    CARD_JSON=$(create_notification_card "$EVENT_TYPE" "$TEMPLATE_COLOR" "$ELEMENTS" "$TIMESTAMP")
+    # Generate signature if secret is available
+    SIGNATURE=""
+    if [ -n "${LARK_SECRET:-}" ]; then
+      SIGNATURE=$(generate_signature "$LARK_SECRET" "$TIMESTAMP")
+    fi
+    CARD_JSON=$(create_notification_card "$EVENT_TYPE" "$TEMPLATE_COLOR" "$ELEMENTS" "$TIMESTAMP" "$SIGNATURE")
     ;;
     
   "workflow_run")
@@ -462,13 +397,16 @@ case "$EVENT_NAME" in
         BUTTON_ACTION=$(create_button_action "${BUTTON1}, ${BUTTON2}")
         
         ELEMENTS="${CONTENT_DIV}, ${DIVIDER}, ${FAILED_JOBS_DIV}, ${DIVIDER2}, ${FIELD_LAYOUT}, ${BUTTON_ACTION}"
-        CARD_JSON=$(create_notification_card "$EVENT_TYPE" "$TEMPLATE_COLOR" "$ELEMENTS" "$TIMESTAMP")
+        # Generate signature if secret is available
+        SIGNATURE=""
+        if [ -n "${LARK_SECRET:-}" ]; then
+          SIGNATURE=$(generate_signature "$LARK_SECRET" "$TIMESTAMP")
+        fi
+        CARD_JSON=$(create_notification_card "$EVENT_TYPE" "$TEMPLATE_COLOR" "$ELEMENTS" "$TIMESTAMP" "$SIGNATURE")
         ;;
         
       "success"|"cancelled"|"skipped"|"neutral")
-        # Check if all workflows for this commit are complete
         echo "Workflow ${WORKFLOW_NAME} completed with status: ${STATUS}"
-        check_all_workflows_complete
         exit 0
         ;;
         
@@ -495,53 +433,45 @@ fi
 echo "🚀 Sending notification to Lark..."
 echo "$CARD_JSON" | jq -C '.'
 
-# Function to generate signature
-generate_signature() {
-  local payload="$1"
-  local secret="$2"
-  local timestamp="$3"
-  
-  if [ -n "$secret" ]; then
-    # Create signature string: timestamp + payload
-    local sign_string="${timestamp}${payload}"
-    # Generate HMAC-SHA256 signature
-    echo -n "$sign_string" | openssl dgst -sha256 -hmac "$secret" -binary | base64
-  else
-    echo ""
-  fi
-}
-
 # Send notification with retry logic
 RETRY_COUNT=0
 MAX_RETRIES=3
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-  # Generate timestamp for signature
-  CURRENT_TIMESTAMP=$(date +%s)
+  # Always use simple headers - signature is now in the request body
+  echo "🚀 Sending notification to Lark webhook..."
+  CURL_HEADERS=(-H 'Content-Type: application/json')
   
-  # Generate signature if secret is provided
-  if [ -n "${LARK_SECRET:-}" ]; then
-    SIGNATURE=$(generate_signature "$CARD_JSON" "$LARK_SECRET" "$CURRENT_TIMESTAMP")
-    CURL_HEADERS=(-H 'Content-Type: application/json' -H "X-Lark-Request-Timestamp: $CURRENT_TIMESTAMP" -H "X-Lark-Request-Nonce: $(uuidgen)" -H "X-Lark-Signature: $SIGNATURE")
-  else
-    CURL_HEADERS=(-H 'Content-Type: application/json')
-  fi
-  
-  if curl -X POST "$LARK_WEBHOOK" \
+  HTTP_RESPONSE=$(curl -X POST "$LARK_WEBHOOK" \
     "${CURL_HEADERS[@]}" \
     -d "$CARD_JSON" \
     --fail-with-body \
     --max-time 30 \
     --retry 2 \
     --retry-delay 5 \
-    --silent \
-    --show-error; then
-    echo "✅ Notification sent successfully"
+    --show-error \
+    --write-out "HTTPSTATUS:%{http_code}" 2>&1)
+  
+  HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep -o "HTTPSTATUS:[0-9]*" | cut -d: -f2)
+  RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | sed 's/HTTPSTATUS:[0-9]*$//')
+  
+  echo "📊 HTTP Status: $HTTP_STATUS"
+  echo "📋 Response Body: $RESPONSE_BODY"
+  
+  if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+    echo "✅ Notification sent successfully (HTTP $HTTP_STATUS)"
     exit 0
   else
     RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "⚠️ Attempt $RETRY_COUNT failed, retrying in 5 seconds..."
-    sleep 5
+    echo "⚠️ Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS)"
+    echo "Response: $RESPONSE_BODY"
+    if [ "$HTTP_STATUS" -eq 401 ] || [ "$HTTP_STATUS" -eq 403 ]; then
+      echo "🔐 Authentication/authorization failed - check LARK_SECRET and signature verification settings"
+    fi
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+      echo "Retrying in 5 seconds..."
+      sleep 5
+    fi
   fi
 done
 
