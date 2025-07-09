@@ -16,7 +16,7 @@
 # Add upstream remote
 git remote add upstream https://github.com/MystenLabs/sui.git
 
-# Set up automatic protection against upstream .github/ changes
+# Set up automatic protection against upstream .github/ changes and README.md
 ./scripts/manage-workflows.sh auto-protect
 ```
 
@@ -26,13 +26,14 @@ git pull upstream main
 # .github/ protection will automatically activate after pull/merge
 ```
 
-This completely protects the .github/ directory from upstream changes, preserving all custom workflows and configurations (like Lark notifications).
+This completely protects the .github/ directory and README.md from upstream changes, preserving all custom workflows and configurations (like Lark notifications).
 
 ## .github/ Protection Commands
 
 **`./scripts/manage-workflows.sh auto-protect`** (Recommended)
 - Sets up automatic protection with git hooks
 - Compares with upstream and protects all `.github/` differences
+- Protects README.md from upstream changes
 - Automatically runs after every pull/merge operation
 - One-time setup for permanent protection
 
@@ -43,8 +44,8 @@ This completely protects the .github/ directory from upstream changes, preservin
 - Creates dummy files for upstream files that don't exist locally
 
 **`./scripts/manage-workflows.sh set`**
-- Basic protection for current `.github/` files
-- Sets skip-worktree for all existing files in `.github/`
+- Basic protection for current `.github/` files and README.md
+- Sets skip-worktree for all existing files in `.github/` and README.md
 - Does not protect against new upstream files
 
 **Other commands:**

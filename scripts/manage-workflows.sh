@@ -10,7 +10,11 @@ set_skip_worktree() {
     git update-index --skip-worktree "$file" 2>/dev/null || true
   done
   
-  echo "✅ All .github/ files are now protected from upstream changes"
+  # Also protect README.md
+  echo "Setting skip-worktree for: README.md"
+  git update-index --skip-worktree "README.md" 2>/dev/null || true
+  
+  echo "✅ All .github/ files and README.md are now protected from upstream changes"
 }
 
 unset_skip_worktree() {
@@ -22,12 +26,16 @@ unset_skip_worktree() {
     git update-index --no-skip-worktree "$file" 2>/dev/null || true
   done
   
-  echo "✅ All .github/ files can now be updated from upstream"
+  # Also unprotect README.md
+  echo "Unsetting skip-worktree for: README.md"
+  git update-index --no-skip-worktree "README.md" 2>/dev/null || true
+  
+  echo "✅ All .github/ files and README.md can now be updated from upstream"
 }
 
 list_skip_worktree() {
-  echo "Files with skip-worktree set in .github/:"
-  git ls-files -v | grep ^S | grep "\.github/"
+  echo "Files with skip-worktree set:"
+  git ls-files -v | grep ^S
 }
 
 protect_upstream_files() {
@@ -75,7 +83,11 @@ protect_upstream_files() {
     fi
   done
   
-  echo "✅ All upstream .github/ files are now protected"
+  # Also protect README.md
+  echo "Protecting existing file: README.md"
+  git update-index --skip-worktree "README.md" 2>/dev/null || true
+  
+  echo "✅ All upstream .github/ files and README.md are now protected"
 }
 
 auto_protect() {
