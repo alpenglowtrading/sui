@@ -4,8 +4,9 @@
 
 use move_package_alt::{
     flavor::MoveFlavor,
+    graph::NamedAddress,
     package::{RootPackage, paths::PackagePath},
-    schema::PackageName,
+    schema::{OriginalID, PackageName},
 };
 
 use colored::Colorize;
@@ -16,11 +17,7 @@ use move_package_alt::package::layout::SourcePackageLayout;
 
 use crate::layout::CompiledPackageLayout;
 
-use move_package_alt::schema::PublishedID;
-
-use move_core_types::account_address::AccountAddress;
-
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use move_binary_format::CompiledModule;
 use move_bytecode_utils::Modules;
 use move_command_line_common::files::{extension_equals, find_filenames, find_move_filenames};
@@ -28,7 +25,7 @@ use move_compiler::{
     Compiler, Flags,
     compiled_unit::{AnnotatedCompiledUnit, CompiledUnit},
     diagnostics::{Diagnostics, report_warnings, warning_filters::WarningFiltersBuilder},
-    editions::Flavor,
+    editions::{Edition, Flavor},
     linters::{self, LINT_WARNING_PREFIX},
     shared::{
         PackageConfig, PackagePaths, SaveFlag, SaveHook,
@@ -36,7 +33,7 @@ use move_compiler::{
     },
     sui_mode,
 };
-use move_core_types::parsing::address::NumericalAddress;
+use move_core_types::{account_address::AccountAddress, parsing::address::NumericalAddress};
 use move_docgen::{Docgen, DocgenFlags, DocgenOptions};
 use move_model_2::source_model;
 use move_symbol_pool::Symbol;
@@ -45,12 +42,18 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 use tracing::debug;
 use vfs::VfsPath;
 
 /// References file for documentation generation
 pub const REFERENCE_TEMPLATE_FILENAME: &str = "references.md";
+
+#[derive(Clone, Debug)]
+pub struct BuildNamedAddresses {
+    pub inner: BTreeMap<Symbol, NumericalAddress>,
+}
 
 /// Represents a compiled package in memory.
 #[derive(Clone, Debug)]
@@ -67,7 +70,7 @@ pub struct CompiledPackage {
     /// filename -> doctext
     pub compiled_docs: Option<Vec<(String, String)>>,
     /// The list of published ids for the dependencies of this package
-    pub deps_published_ids: Vec<PublishedID>,
+    pub deps_published_ids: Vec<OriginalID>,
     /// The mapping of file hashes to file names and contents
     pub file_map: MappedFiles,
 }
@@ -93,12 +96,21 @@ pub struct CompiledUnitWithSource {
 
 impl CompiledPackage {
     /// Return an iterator over all compiled units in this package, including dependencies
-    pub fn get_all_compiled_units_with_source(
-        &self,
-    ) -> impl Iterator<Item = &CompiledUnitWithSource> {
+    pub fn all_compiled_units_with_source(&self) -> impl Iterator<Item = &CompiledUnitWithSource> {
         self.root_compiled_units
             .iter()
             .chain(self.deps_compiled_units.iter().map(|(_, unit)| unit))
+    }
+
+    /// Returns all compiled units for this package in transitive dependencies. Order is not
+    /// guaranteed.
+    pub fn all_compiled_units(&self) -> impl Iterator<Item = &CompiledUnit> {
+        self.all_compiled_units_with_source().map(|unit| &unit.unit)
+    }
+
+    /// Returns compiled modules for this package and its transitive dependencies
+    pub fn all_modules_map(&self) -> Modules {
+        Modules::new(self.all_compiled_units().map(|unit| &unit.module))
     }
 
     /// `root_compiled_units` filtered over `CompiledUnit::Module`
@@ -108,7 +120,7 @@ impl CompiledPackage {
 
     /// Return an iterator over all bytecode modules in this package, including dependencies
     pub fn get_modules_and_deps(&self) -> impl Iterator<Item = &CompiledModule> {
-        self.get_all_compiled_units_with_source()
+        self.all_compiled_units_with_source()
             .map(|m| &m.unit.module)
     }
 
@@ -199,7 +211,7 @@ impl CompiledPackage {
     }
 
     /// Return the published ids of the dependencies of this package
-    pub fn dependency_ids(&self) -> Vec<PublishedID> {
+    pub fn dependency_ids(&self) -> Vec<OriginalID> {
         self.deps_published_ids.clone()
     }
 }
@@ -343,7 +355,7 @@ fn _decorate_warnings(warning_diags: Diagnostics, files: Option<&MappedFiles>) {
     }
 }
 
-fn source_paths_for_config(package_path: &Path) -> Vec<PathBuf> {
+fn source_paths_for_config(package_path: &Path, config: &BuildConfig) -> Vec<PathBuf> {
     let mut places_to_look = Vec::new();
     let mut add_path = |layout_path: SourcePackageLayout| {
         let path = package_path.join(layout_path.path());
@@ -356,6 +368,10 @@ fn source_paths_for_config(package_path: &Path) -> Vec<PathBuf> {
     add_path(SourcePackageLayout::Sources);
     add_path(SourcePackageLayout::Scripts);
 
+    if config.test_mode {
+        add_path(SourcePackageLayout::Tests);
+    }
+
     places_to_look
         .into_iter()
         .filter(|path| path.exists())
@@ -363,8 +379,8 @@ fn source_paths_for_config(package_path: &Path) -> Vec<PathBuf> {
 }
 
 // Find all the source files for a package at the given path
-fn get_sources(path: &PackagePath) -> Result<Vec<FileName>> {
-    let places_to_look = source_paths_for_config(path.path());
+fn get_sources(path: &PackagePath, config: &BuildConfig) -> Result<Vec<FileName>> {
+    let places_to_look = source_paths_for_config(path.path(), config);
     Ok(find_move_filenames(&places_to_look, false)?
         .into_iter()
         .map(FileName::from)
@@ -439,25 +455,27 @@ fn compiler_flags(build_config: &BuildConfig) -> Flags {
 pub fn build_all<W: Write, F: MoveFlavor>(
     w: &mut W,
     vfs_root: Option<VfsPath>,
-    project_root: &Path,
-    root_pkg: RootPackage<F>,
-    package_name: PackageName,
+    root_pkg: &RootPackage<F>,
     build_config: &BuildConfig,
     compiler_driver: impl FnOnce(Compiler) -> Result<(MappedFiles, Vec<AnnotatedCompiledUnit>)>,
 ) -> Result<CompiledPackage> {
+    let deps_published_ids = root_pkg.deps_published_ids().clone();
+    let project_root = root_pkg.path().as_ref().to_path_buf();
     let program_info_hook = SaveHook::new([SaveFlag::TypingInfo]);
+    let package_name = Symbol::from(root_pkg.name().as_str());
     let (file_map, all_compiled_units) =
         build_for_driver(w, vfs_root, build_config, root_pkg, |compiler| {
             let compiler = compiler.add_save_hook(&program_info_hook);
             compiler_driver(compiler)
         })?;
 
-    let published_ids = vec![];
-
     let mut all_compiled_units_vec = vec![];
     let mut root_compiled_units = vec![];
     let mut deps_compiled_units = vec![];
-    let root_package_name = Symbol::from(package_name.as_str());
+
+    // TODO: improve/rework this? Renaming the root pkg to have a unique name for the compiler
+    // this has to match whatever we're doing in build_for_driver function
+    let root_package_name = Symbol::from(format!("{}_root", package_name.as_str()));
 
     for mut annot_unit in all_compiled_units {
         let source_path = PathBuf::from(
@@ -509,7 +527,7 @@ pub fn build_all<W: Write, F: MoveFlavor>(
             DocgenFlags::default(), // TODO this should be configurable
             root_package_name,
             &model,
-            project_root,
+            &project_root,
             //TODO Fix this, it needs immediate dependencies for this pkg
             &[],
             // &immediate_dependencies,
@@ -526,6 +544,7 @@ pub fn build_all<W: Write, F: MoveFlavor>(
         build_flags: build_config.clone(),
     };
 
+    // TODO: take into consideration install dir flag
     let under_path = project_root.join("build");
 
     save_to_disk(
@@ -542,7 +561,7 @@ pub fn build_all<W: Write, F: MoveFlavor>(
         root_compiled_units,
         deps_compiled_units,
         compiled_docs: None,
-        deps_published_ids: published_ids,
+        deps_published_ids,
         file_map,
         // compiled_docs,
     };
@@ -550,98 +569,54 @@ pub fn build_all<W: Write, F: MoveFlavor>(
     Ok(compiled_package)
 }
 
+#[allow(unreachable_code)] // TODO
 pub(crate) fn build_for_driver<W: Write, T, F: MoveFlavor>(
     w: &mut W,
     vfs_root: Option<VfsPath>,
     build_config: &BuildConfig,
-    root_pkg: RootPackage<F>,
+    root_pkg: &RootPackage<F>,
     compiler_driver: impl FnOnce(Compiler) -> Result<T>,
 ) -> Result<T> {
-    let deps = root_pkg.dependencies();
+    let packages = root_pkg.packages()?;
 
-    // TODO: this should go away up to see below
-    let names = BTreeMap::from([
-        ("Sui", "sui"),
-        ("SuiSystem", "sui_system"),
-        ("MoveStdlib", "std"),
-    ]);
+    let mut package_paths: Vec<PackagePaths> = vec![];
 
-    let mut named_address_map: BTreeMap<Symbol, NumericalAddress> = BTreeMap::new();
+    for (counter, pkg) in packages.into_iter().enumerate() {
+        let name: Symbol = pkg.name().as_str().into();
 
-    for node in &deps {
-        println!("Node {:?}", node);
-        let addr = &node
-            .published_at()
-            .ok_or_else(|| anyhow!("Expected package to have a published addr"))?;
-        // published_ids.push(addr.clone());
-        let addr = NumericalAddress::new(
-            addr.0.into_bytes(),
-            move_compiler::shared::NumberFormat::Hex,
-        );
-        let pkg_name: Symbol = if names.contains_key(&node.name().as_str()) {
-            // return one of the standard aliases
-            (*names.get(node.name().as_str()).unwrap()).into()
+        if !pkg.is_root() {
+            writeln!(w, "{} {name}", "INCLUDING DEPENDENCY".bold().green())?;
+        }
+
+        let addresses: BuildNamedAddresses = pkg.named_addresses()?.into();
+
+        // TODO: better default handling for edition and flavor
+        let config = PackageConfig {
+            is_dependency: !pkg.is_root(),
+            edition: Edition::from_str(pkg.edition())?,
+            flavor: Flavor::from_str(pkg.flavor().unwrap_or("sui"))?,
+            warning_filter: WarningFiltersBuilder::new_for_source(),
+        };
+
+        // TODO: improve/rework this? Renaming the root pkg to have a unique name for the compiler
+        let safe_name = if pkg.is_root() {
+            Symbol::from(format!("{}_root", name))
         } else {
-            node.name().as_str().into()
+            Symbol::from(format!("{}_{}", name, counter))
         };
 
-        named_address_map.insert(pkg_name, addr);
-    }
-
-    named_address_map.insert(
-        root_pkg.name().as_str().into(),
-        NumericalAddress::new(
-            AccountAddress::from_hex_literal("0x0")
-                .unwrap()
-                .into_bytes(),
-            move_compiler::shared::NumberFormat::Hex,
-        ),
-    );
-
-    // up to here
-
-    let mut dependencies_paths = vec![];
-
-    // Find the source paths for each dependency and build the PackagePaths
-    for node in &deps {
-        writeln!(
-            w,
-            "{} {}",
-            "INCLUDING DEPENDENCY".bold().green(),
-            node.name()
-        )?;
-        let sources = get_sources(node.path())?;
-        let is_dependency = node.name() != root_pkg.name();
-
-        debug!("Node: {:?}, is dependency: {is_dependency}", node.name());
-
-        // TODO: probably here we need to use a different type than Symbol
-        let source_package_paths: PackagePaths<Symbol, Symbol> = PackagePaths {
-            name: Some((
-                node.name().as_str().into(),
-                PackageConfig {
-                    is_dependency,
-                    warning_filter: WarningFiltersBuilder::new_for_source(),
-                    // TODO: we need to use this probably in the manifest for deserialization
-                    flavor: move_compiler::editions::Flavor::Sui,
-                    // TODO: we should add this to the type in the manifest.
-                    edition: move_compiler::editions::Edition {
-                        // TODO: we need edition in root pkg
-                        edition: Symbol::from(""), // root_pkg.edition().into(),
-                        // TODO: should we have this as a field?
-                        release: None,
-                    },
-                },
-            )),
-            // TODO: fixed named_address map for each package. It should contain the package
-            // and its direct deps
-            // named_address_map: BTreeMap::new(),
-            named_address_map: named_address_map.clone(),
-            paths: sources,
+        debug!("Package name {:?} -- Safe name {:?}", name, safe_name);
+        debug!("Named address map {:#?}", addresses);
+        let paths = PackagePaths {
+            name: Some((safe_name, config)),
+            paths: get_sources(pkg.path(), build_config)?,
+            named_address_map: addresses.inner,
         };
 
-        dependencies_paths.push(source_package_paths);
+        package_paths.push(paths);
     }
+
+    debug!("Package paths {:#?}", package_paths);
 
     writeln!(w, "{} {}", "BUILDING".bold().green(), root_pkg.name())?;
 
@@ -649,7 +624,7 @@ pub(crate) fn build_for_driver<W: Write, T, F: MoveFlavor>(
     let sui_mode = build_config.default_flavor == Some(Flavor::Sui);
     let flags = compiler_flags(build_config);
 
-    let mut compiler = Compiler::from_package_paths(vfs_root, dependencies_paths, vec![])
+    let mut compiler = Compiler::from_package_paths(vfs_root, package_paths, vec![])
         .unwrap()
         .set_flags(flags);
     if sui_mode {
@@ -664,4 +639,24 @@ pub(crate) fn build_for_driver<W: Write, T, F: MoveFlavor>(
         .add_visitors(linters::linter_visitors(lint_level));
 
     compiler_driver(compiler)
+}
+
+impl From<BTreeMap<PackageName, NamedAddress>> for BuildNamedAddresses {
+    fn from(value: BTreeMap<PackageName, NamedAddress>) -> Self {
+        let mut addresses: BTreeMap<Symbol, NumericalAddress> = BTreeMap::new();
+        for (dep_name, dep) in value {
+            let name = dep_name.as_str().into();
+
+            let addr = match dep {
+                NamedAddress::RootPackage(_) => AccountAddress::ZERO,
+                NamedAddress::Unpublished { dummy_addr } => dummy_addr.0,
+                NamedAddress::Defined(original_id) => original_id.0,
+            };
+
+            let addr: NumericalAddress =
+                NumericalAddress::new(addr.into_bytes(), move_compiler::shared::NumberFormat::Hex);
+            addresses.insert(name, addr);
+        }
+        Self { inner: addresses }
+    }
 }

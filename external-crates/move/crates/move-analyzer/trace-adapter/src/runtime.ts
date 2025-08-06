@@ -4,7 +4,7 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
-import toml from 'toml';
+import toml from '@iarna/toml';
 import {
     createFileInfo,
     IFileInfo,
@@ -80,7 +80,20 @@ export interface IRuntimeGlobalLoc {
  * Location where a runtime value is stored.
  */
 export interface IRuntimeLoc {
+    /**
+     * Location of a variable of a global location that
+     * contains a potentially compound value.
+     */
     loc: IRuntimeVariableLoc | IRuntimeGlobalLoc;
+    /**
+     * Optional "path" that points to a specific element
+     * of a compound value. For example if value at 'loc'
+     * is a vector of structs, `indexPath` of [7][2] would
+     * mean 7th element of the vector, and second field
+     * of this (struct) element. In terms of trace format,
+     * this is used to represent 'Indexed' locations (hence
+     * the name).
+     */
     indexPath: number[];
 }
 
@@ -1763,7 +1776,7 @@ async function findPkgRoot(active_file_path: string): Promise<string | undefined
  */
 function getPkgNameFromManifest(pkgRoot: string): string | undefined {
     const manifest = fs.readFileSync(pkgRoot, 'utf8');
-    const parsedManifest = toml.parse(manifest);
+    const parsedManifest = toml.parse(manifest) as any;
     const packageName = parsedManifest.package.name;
     return packageName;
 }

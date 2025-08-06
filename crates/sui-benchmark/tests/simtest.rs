@@ -716,9 +716,7 @@ mod test {
             return;
         }
 
-        unsafe {
-            std::env::set_var("TRANSACTION_DRIVER", "100");
-        }
+        std::env::set_var("TRANSACTION_DRIVER", "100");
 
         let test_cluster = build_test_cluster(4, 30_000, 1).await;
         test_simulated_load(test_cluster, 120).await;
@@ -1048,6 +1046,7 @@ mod test {
             })
             .with_submit_delay_step_override_millis(3000)
             .with_num_unpruned_validators(default_num_of_unpruned_validators)
+            .disable_fullnode_pruning()
             .build()
             .await
             .into()
@@ -1057,10 +1056,12 @@ mod test {
         default_num_validators: usize,
         default_epoch_duration_ms: u64,
     ) -> TestClusterBuilder {
-        let mut builder = TestClusterBuilder::new().with_num_validators(get_var(
-            "SIM_STRESS_TEST_NUM_VALIDATORS",
-            default_num_validators,
-        ));
+        let mut builder = TestClusterBuilder::new()
+            .with_num_validators(get_var(
+                "SIM_STRESS_TEST_NUM_VALIDATORS",
+                default_num_validators,
+            ))
+            .with_synthetic_execution_time_injection();
         if std::env::var("CHECKPOINTS_PER_EPOCH").is_ok() {
             eprintln!("CHECKPOINTS_PER_EPOCH env var is deprecated, use EPOCH_DURATION_MS");
         }

@@ -18,8 +18,10 @@ use sui_core::{
         QuorumDriverHandlerBuilder, QuorumDriverMetrics,
     },
     transaction_driver::{
-        SubmitTransactionOptions, SubmitTxRequest, TransactionDriver, TransactionDriverMetrics,
+        choose_transaction_driver_percentage, SubmitTransactionOptions, SubmitTxRequest,
+        TransactionDriver, TransactionDriverMetrics,
     },
+    validator_client_monitor::ValidatorClientMetrics,
 };
 use sui_json_rpc_types::{
     SuiObjectDataOptions, SuiObjectResponse, SuiObjectResponseQuery, SuiTransactionBlockEffects,
@@ -279,18 +281,10 @@ impl LocalValidatorAggregatorProxy {
             .build_network_clients();
         let committee = genesis.committee().unwrap();
 
-        let td_percentage = 'td: {
-            if let Some(tx_driver_percentage) = transaction_driver_percentage {
-                break 'td tx_driver_percentage;
-            }
-            if let Ok(v) = std::env::var("TRANSACTION_DRIVER") {
-                if let Ok(tx_driver_percentage) = v.parse::<u8>() {
-                    if tx_driver_percentage > 0 && tx_driver_percentage <= 100 {
-                        break 'td tx_driver_percentage;
-                    }
-                }
-            }
-            0
+        let td_percentage = if let Some(tx_driver_percentage) = transaction_driver_percentage {
+            tx_driver_percentage
+        } else {
+            choose_transaction_driver_percentage()
         };
 
         Self::new_impl(
@@ -348,7 +342,16 @@ impl LocalValidatorAggregatorProxy {
                 .with_reconfig_observer(reconfig_observer.clone());
         let qd_handler = qd_handler_builder.start();
         let qd = qd_handler.clone_quorum_driver();
-        let td = TransactionDriver::new(aggregator, reconfig_observer, transaction_driver_metrics);
+        let client_metrics = Arc::new(ValidatorClientMetrics::new(&Registry::new()));
+
+        // For benchmark, pass None to use default validator client monitor config
+        let td = TransactionDriver::new(
+            aggregator,
+            reconfig_observer,
+            transaction_driver_metrics,
+            None,
+            client_metrics,
+        );
         Self {
             _qd_handler: qd_handler,
             qd,

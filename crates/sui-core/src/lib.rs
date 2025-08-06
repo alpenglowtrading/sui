@@ -37,6 +37,7 @@ pub mod rpc_index;
 pub mod safe_client;
 mod scoring_decision;
 mod stake_aggregator;
+mod status_aggregator;
 pub mod storage;
 pub mod streamer;
 pub mod subscription_handler;
@@ -46,6 +47,7 @@ pub mod transaction_driver;
 mod transaction_input_loader;
 pub mod transaction_orchestrator;
 mod transaction_outputs;
+pub mod validator_client_monitor;
 pub mod validator_tx_finalizer;
 pub mod verify_indexes;
 

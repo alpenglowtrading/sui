@@ -93,6 +93,7 @@ use super::shared_object_congestion_tracker::{
 };
 use super::shared_object_version_manager::AssignedVersions;
 use super::transaction_deferral::{transaction_deferral_within_limit, DeferralKey, DeferralReason};
+use super::transaction_reject_reason_cache::TransactionRejectReasonCache;
 use crate::authority::epoch_start_configuration::EpochStartConfiguration;
 use crate::authority::execution_time_estimator::EXTRA_FIELD_EXECUTION_TIME_ESTIMATES_KEY;
 use crate::authority::shared_object_version_manager::{
@@ -420,6 +421,9 @@ pub struct AuthorityPerEpochStore {
 
     pub(crate) consensus_tx_status_cache: Option<ConsensusTxStatusCache>,
 
+    /// A cache that maintains the reject vote reason for a transaction.
+    pub(crate) tx_reject_reason_cache: Option<TransactionRejectReasonCache>,
+
     /// Waiters for settlement transactions. Used by execution scheduler to wait for
     /// settlement transaction keys to resolve to transactions.
     /// Stored in AuthorityPerEpochStore so that it is automatically cleaned up at the end of the epoch.
@@ -621,7 +625,7 @@ impl AuthorityEpochTables {
             .disable_unload()
             .with_value_cache_size(1000);
         let builder_checkpoint_summary_v2_config = pending_checkpoint_signatures_config.clone();
-        let object_ref_indexing = KeyIndexing::hash();
+        let object_ref_indexing = KeyIndexing::Hash;
         let tx_digest_indexing = KeyIndexing::key_reduction(32, 0..16);
         let uniform_key = KeyType::uniform(default_cells_per_mutex());
         let sequence_key = KeyType::prefix_uniform(2, 4);
@@ -779,7 +783,7 @@ impl AuthorityEpochTables {
             (
                 "pending_jwks".to_string(),
                 ThConfig::new_with_config_indexing(
-                    KeyIndexing::Hash,
+                    KeyIndexing::VariableLength,
                     1,
                     KeyType::uniform(1),
                     KeySpaceConfig::default(),
@@ -788,7 +792,7 @@ impl AuthorityEpochTables {
             (
                 "active_jwks".to_string(),
                 ThConfig::new_with_config_indexing(
-                    KeyIndexing::Hash,
+                    KeyIndexing::VariableLength,
                     1,
                     KeyType::uniform(1),
                     KeySpaceConfig::default(),
@@ -1046,6 +1050,7 @@ impl AuthorityPerEpochStore {
             protocol_config.accept_passkey_in_multisig(),
             protocol_config.zklogin_max_epoch_upper_bound_delta(),
             protocol_config.get_aliased_addresses().clone(),
+            protocol_config.additional_multisig_checks(),
         );
 
         let authenticator_state_exists = epoch_start_configuration
@@ -1118,6 +1123,12 @@ impl AuthorityPerEpochStore {
             None
         };
 
+        let tx_reject_reason_cache = if protocol_config.mysticeti_fastpath() {
+            Some(TransactionRejectReasonCache::new(None, epoch_id))
+        } else {
+            None
+        };
+
         let s = Arc::new(Self {
             name,
             committee: committee.clone(),
@@ -1158,6 +1169,7 @@ impl AuthorityPerEpochStore {
             tx_object_debts: OnceCell::new(),
             end_of_epoch_execution_time_observations: OnceCell::new(),
             consensus_tx_status_cache,
+            tx_reject_reason_cache,
             settlement_registrations: Default::default(),
         });
 
@@ -1898,12 +1910,16 @@ impl AuthorityPerEpochStore {
         let tables = self.tables()?;
         Ok(self
             .checkpoint_state_notify_read
-            .read(checkpoints, |checkpoints| {
-                tables
-                    .state_hash_by_checkpoint
-                    .multi_get(checkpoints)
-                    .expect("db error")
-            })
+            .read(
+                "notify_read_checkpoint_state_hasher",
+                checkpoints,
+                |checkpoints| {
+                    tables
+                        .state_hash_by_checkpoint
+                        .multi_get(checkpoints)
+                        .expect("db error")
+                },
+            )
             .await)
     }
 
@@ -3612,6 +3628,10 @@ impl AuthorityPerEpochStore {
             all_certs,
             cancelled_txns,
         )?;
+        debug!(
+            "Assigned versions from consensus processing: {:?}",
+            assigned_versions
+        );
 
         output.set_next_shared_object_versions(shared_input_next_versions);
         Ok(assigned_versions)
@@ -4798,6 +4818,23 @@ impl AuthorityPerEpochStore {
     ) {
         if let Some(cache) = self.consensus_tx_status_cache.as_ref() {
             cache.set_transaction_status(position, status);
+        }
+    }
+
+    pub(crate) fn set_rejection_vote_reason(&self, position: ConsensusPosition, reason: &SuiError) {
+        if let Some(tx_reject_reason_cache) = self.tx_reject_reason_cache.as_ref() {
+            tx_reject_reason_cache.set_rejection_vote_reason(position, reason);
+        }
+    }
+
+    pub(crate) fn get_rejection_vote_reason(
+        &self,
+        position: ConsensusPosition,
+    ) -> Option<SuiError> {
+        if let Some(tx_reject_reason_cache) = self.tx_reject_reason_cache.as_ref() {
+            tx_reject_reason_cache.get_rejection_vote_reason(position)
+        } else {
+            None
         }
     }
 

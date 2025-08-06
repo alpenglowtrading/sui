@@ -66,13 +66,13 @@ use crate::{
     authority::{
         authority_per_epoch_store::AuthorityPerEpochStore,
         consensus_tx_status_cache::NotifyReadConsensusTxStatusResult,
-        shared_object_version_manager::Schedulable, ExecutionEnv,
+        shared_object_version_manager::Schedulable, ExecutionEnv, WAIT_FOR_FASTPATH_INPUT_TIMEOUT,
     },
     checkpoints::CheckpointStore,
     execution_scheduler::SchedulingSource,
     mysticeti_adapter::LazyMysticetiClient,
     transaction_driver::{
-        ExecutedData, RejectReason, SubmitTxResponse, WaitForEffectsRequest, WaitForEffectsResponse,
+        ExecutedData, SubmitTxResponse, WaitForEffectsRequest, WaitForEffectsResponse,
     },
     transaction_outputs::TransactionOutputs,
 };
@@ -597,6 +597,28 @@ impl ValidatorService {
                 let executed_resp = executed_resp.try_into()?;
                 return Ok((tonic::Response::new(executed_resp), Weight::zero()));
             }
+        }
+
+        // Use shorter wait timeout in simtests to exercise server-side error paths and
+        // client-side retry logic.
+        let wait_for_fastpath_dependency_objects_timeout = if cfg!(msim) {
+            Duration::from_millis(100)
+        } else {
+            WAIT_FOR_FASTPATH_INPUT_TIMEOUT
+        };
+        if !state
+            .wait_for_fastpath_dependency_objects(
+                &transaction,
+                epoch_store.epoch(),
+                wait_for_fastpath_dependency_objects_timeout,
+            )
+            .await?
+        {
+            debug!(
+                ?tx_digest,
+                "Fastpath input objects are still unavailable after waiting"
+            );
+            // Proceed with input checks to generate a proper error.
         }
 
         state
@@ -1153,7 +1175,10 @@ impl ValidatorService {
             let mut effects = self
                 .state
                 .get_transaction_cache_reader()
-                .notify_read_executed_effects(&tx_digests)
+                .notify_read_executed_effects(
+                    "AuthorityServer::notify_read_executed_effects_finalized",
+                    &tx_digests,
+                )
                 .await;
             let effects = effects.pop().unwrap();
             let effects_digest = effects.digest();
@@ -1210,11 +1235,10 @@ impl ValidatorService {
         let mut cur_status = match first_status {
             NotifyReadConsensusTxStatusResult::Status(status) => match status {
                 ConsensusTxStatus::Rejected => {
-                    let response = WaitForEffectsResponse::Rejected {
-                        // TODO(fastpath): Add reject reason.
-                        reason: RejectReason::None,
-                    };
-                    return Ok(response);
+                    let error = epoch_store
+                        .get_rejection_vote_reason(consensus_position)
+                        .unwrap_or(SuiError::TransactionRejectReasonNotFound { digest: tx_digest });
+                    return Ok(WaitForEffectsResponse::Rejected { error });
                 }
                 ConsensusTxStatus::FastpathCertified | ConsensusTxStatus::Finalized => status,
             },
@@ -1241,7 +1265,8 @@ impl ValidatorService {
                     match second_status {
                         NotifyReadConsensusTxStatusResult::Status(status) => {
                             if status == ConsensusTxStatus::Rejected {
-                                return Ok(WaitForEffectsResponse::Rejected { reason: RejectReason::None });
+                                let error = epoch_store.get_rejection_vote_reason(consensus_position).unwrap_or(SuiError::TransactionRejectReasonNotFound { digest: tx_digest });
+                                return Ok(WaitForEffectsResponse::Rejected { error });
                             }
                             assert_eq!(status, ConsensusTxStatus::Finalized);
                             // Update the current status so that notify_read_transaction_status will no
@@ -1259,7 +1284,10 @@ impl ValidatorService {
                 },
                 mut effects = self.state
                     .get_transaction_cache_reader()
-                    .notify_read_executed_effects(&tx_digests) => {
+                    .notify_read_executed_effects("AuthorityServer::notify_read_executed_effects", &tx_digests) => {
+
+                    // unwrap is safe because notify_read_executed_effects is expected
+                    // to return the same amount of effects as the provided transactions.
                     let effects = effects.pop().unwrap();
                     let effects_digest = effects.digest();
                     debug!(
@@ -1267,8 +1295,6 @@ impl ValidatorService {
                         ?effects_digest,
                         "Observed executed effects",
                     );
-                    // unwrap is safe because notify_read_executed_effects is expected
-                    // to return the same amount of effects as the provided transactions.
                     break (effects, None);
                 },
                 mut outputs = self.state.get_transaction_cache_reader().notify_read_fastpath_transaction_outputs(&tx_digests) => {
@@ -1539,6 +1565,54 @@ impl ValidatorService {
             .get_object_cache_reader()
             .get_sui_system_state_object_unsafe()?;
         Ok((tonic::Response::new(response), Weight::one()))
+    }
+
+    async fn validator_health_impl(
+        &self,
+        _request: tonic::Request<sui_types::messages_grpc::RawValidatorHealthRequest>,
+    ) -> WrappedServiceResponse<sui_types::messages_grpc::RawValidatorHealthResponse> {
+        let state = &self.state;
+
+        // Get epoch store once for both metrics
+        let epoch_store = state.load_epoch_store_one_call_per_task();
+
+        // Get in-flight execution transactions from execution scheduler
+        let num_inflight_execution_transactions =
+            state.execution_scheduler().num_pending_certificates() as u64;
+
+        // Get in-flight consensus transactions from consensus adapter
+        let num_inflight_consensus_transactions =
+            self.consensus_adapter.num_inflight_transactions();
+
+        // Get last committed leader round from epoch store
+        let last_committed_leader_round = epoch_store
+            .consensus_tx_status_cache
+            .as_ref()
+            .and_then(|cache| cache.get_last_committed_leader_round())
+            .unwrap_or(0);
+
+        // Get last locally built checkpoint sequence
+        let last_locally_built_checkpoint = epoch_store
+            .last_built_checkpoint_summary()
+            .ok()
+            .flatten()
+            .map(|(_, summary)| summary.sequence_number)
+            .unwrap_or(0);
+
+        let typed_response = sui_types::messages_grpc::ValidatorHealthResponse {
+            num_inflight_consensus_transactions,
+            num_inflight_execution_transactions,
+            last_locally_built_checkpoint,
+            last_committed_leader_round,
+        };
+
+        let raw_response = typed_response
+            .try_into()
+            .map_err(|e: sui_types::error::SuiError| {
+                tonic::Status::internal(format!("Failed to serialize health response: {}", e))
+            })?;
+
+        Ok((tonic::Response::new(raw_response), Weight::one()))
     }
 
     fn get_client_ip_addr<T>(
@@ -1856,5 +1930,13 @@ impl Validator for ValidatorService {
         request: tonic::Request<SystemStateRequest>,
     ) -> Result<tonic::Response<SuiSystemState>, tonic::Status> {
         handle_with_decoration!(self, get_system_state_object_impl, request)
+    }
+
+    async fn validator_health(
+        &self,
+        request: tonic::Request<sui_types::messages_grpc::RawValidatorHealthRequest>,
+    ) -> Result<tonic::Response<sui_types::messages_grpc::RawValidatorHealthResponse>, tonic::Status>
+    {
+        handle_with_decoration!(self, validator_health_impl, request)
     }
 }

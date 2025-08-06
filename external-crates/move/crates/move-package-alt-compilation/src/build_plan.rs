@@ -13,40 +13,26 @@ use crate::{
 use move_compiler::{
     Compiler,
     compiled_unit::AnnotatedCompiledUnit,
+    diagnostics::report_diagnostics_to_buffer_with_env_color,
     shared::{SaveFlag, SaveHook, files::MappedFiles},
 };
 use move_package_alt::{
-    errors::PackageResult,
+    errors::{PackageError, PackageResult},
     flavor::MoveFlavor,
-    graph::PackageGraph,
     package::RootPackage,
-    schema::{Environment, PackageName},
 };
 
 #[derive(Debug)]
 pub struct BuildPlan<F: MoveFlavor> {
     root_pkg: RootPackage<F>,
-    _env: Environment,
-    _sorted_deps: Vec<PackageName>,
-    _package_graph: PackageGraph<F>,
     compiler_vfs_root: Option<VfsPath>,
     build_config: BuildConfig,
 }
 
 impl<F: MoveFlavor> BuildPlan<F> {
-    pub fn create(
-        root_pkg: RootPackage<F>,
-        build_config: &BuildConfig,
-        env: &Environment,
-    ) -> PackageResult<Self> {
-        let _package_graph = root_pkg.package_graph().clone();
-        let _sorted_deps = root_pkg.package_graph().sorted_deps();
-
+    pub fn create(root_pkg: RootPackage<F>, build_config: &BuildConfig) -> PackageResult<Self> {
         Ok(Self {
             root_pkg,
-            _env: env.clone(),
-            _sorted_deps,
-            _package_graph,
             build_config: build_config.clone(),
             compiler_vfs_root: None,
         })
@@ -80,24 +66,19 @@ impl<F: MoveFlavor> BuildPlan<F> {
     }
 
     pub fn compile_with_driver<W: Write>(
-        self,
+        &self,
         writer: &mut W,
         compiler_driver: impl FnOnce(
             Compiler,
         )
             -> anyhow::Result<(MappedFiles, Vec<AnnotatedCompiledUnit>)>,
     ) -> PackageResult<CompiledPackage> {
-        let project_root = self.root_pkg.package_path().clone();
-        let project_root = project_root.path();
-        let package_name = self.root_pkg.name().clone();
         let program_info_hook = SaveHook::new([SaveFlag::TypingInfo]);
         let compiled = build_all::<W, F>(
             writer,
             self.compiler_vfs_root.clone(),
-            project_root,
-            self.root_pkg,
-            package_name,
-            &self.build_config.clone(),
+            &self.root_pkg,
+            &self.build_config,
             |compiler| {
                 let compiler = compiler.add_save_hook(&program_info_hook);
                 compiler_driver(compiler)
@@ -113,6 +94,44 @@ impl<F: MoveFlavor> BuildPlan<F> {
         // )?;
 
         Ok(compiled)
+    }
+
+    /// Compilation process does not exit even if warnings/failures are encountered
+    pub fn compile_no_exit<W: Write>(
+        &self,
+        writer: &mut W,
+        modify_compiler: impl FnOnce(Compiler) -> Compiler,
+    ) -> PackageResult<CompiledPackage> {
+        let mut diags = None;
+        let res = self.compile_with_driver(writer, |compiler| {
+            let (files, units_res) = modify_compiler(compiler).build()?;
+            match units_res {
+                Ok((units, warning_diags)) => {
+                    diags = Some(report_diagnostics_to_buffer_with_env_color(
+                        &files,
+                        warning_diags,
+                    ));
+                    Ok((files, units))
+                }
+                Err(error_diags) => {
+                    assert!(!error_diags.is_empty());
+                    diags = Some(report_diagnostics_to_buffer_with_env_color(
+                        &files,
+                        error_diags,
+                    ));
+                    anyhow::bail!("Compilation error");
+                }
+            }
+        });
+        if let Some(diags) = diags {
+            if let Err(err) = std::io::stdout().write_all(&diags) {
+                return Err(PackageError::Generic(format!(
+                    "Cannot output compiler diagnostics: {}",
+                    err
+                )));
+            }
+        }
+        res
     }
 
     // Clean out old packages that are no longer used, or no longer used under the current
