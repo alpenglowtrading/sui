@@ -11,6 +11,7 @@
 # Rust build directory
 **/target
 .pre-commit*
+sui-binary
 
 # Move build directory
 build
