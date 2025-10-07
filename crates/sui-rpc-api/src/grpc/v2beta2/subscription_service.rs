@@ -36,17 +36,17 @@ impl SubscriptionService for SubscriptionServiceHandle {
 
         let response = Box::pin(async_stream::stream! {
             while let Some(checkpoint) = receiver.recv().await {
+                let checkpoint: sui_types::full_checkpoint_content::CheckpointData = checkpoint.as_ref().to_owned().into();
                 let cursor = checkpoint.checkpoint_summary.sequence_number;
 
                 let checkpoint = Checkpoint::merge_from(
-                    checkpoint.as_ref().to_owned(), // TODO optimize so checkpoint isn't cloned
+                    checkpoint, // TODO optimize so checkpoint isn't cloned
                     &read_mask
                 );
 
-                let response = SubscribeCheckpointsResponse {
-                    cursor: Some(cursor),
-                    checkpoint: Some(checkpoint),
-                };
+                let mut response = SubscribeCheckpointsResponse::default();
+                response.cursor = Some(cursor);
+                response.checkpoint = Some(checkpoint);
 
                 yield Ok(response);
             }

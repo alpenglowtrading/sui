@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use sui_json_rpc_api::{TRANSACTION_EXECUTION_CLIENT_ERROR_CODE, TRANSIENT_ERROR_CODE};
 use sui_name_service::NameServiceError;
 use sui_types::committee::{QUORUM_THRESHOLD, TOTAL_VOTING_POWER};
-use sui_types::error::{SuiError, SuiObjectResponseError, UserInputError};
+use sui_types::error::{ErrorCategory, SuiError, SuiObjectResponseError, UserInputError};
 use sui_types::quorum_driver_types::QuorumDriverError;
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -160,6 +160,7 @@ impl From<Error> for ErrorObjectOwned {
                         )
                     }
                     QuorumDriverError::TimeoutBeforeFinality
+                    | QuorumDriverError::TimeoutBeforeFinalityWithErrors { .. }
                     | QuorumDriverError::FailedWithTransientErrorAfterMaximumAttempts { .. } => {
                         ErrorObject::owned(TRANSIENT_ERROR_CODE, err.to_string(), None::<()>)
                     }
@@ -271,15 +272,26 @@ impl From<Error> for ErrorObjectOwned {
                     | QuorumDriverError::SystemOverloadRetryAfter { .. } => {
                         ErrorObject::owned(TRANSIENT_ERROR_CODE, err.to_string(), None::<()>)
                     }
-                    QuorumDriverError::TransactionFailed { retriable, details } => {
-                        // TODO(fastpath): Replace with a proper error code
+                    QuorumDriverError::TransactionFailed { category, details } => {
+                        let code = match category {
+                            ErrorCategory::Internal => INTERNAL_ERROR_CODE,
+                            ErrorCategory::Aborted => TRANSIENT_ERROR_CODE,
+                            ErrorCategory::InvalidTransaction => TRANSACTION_EXECUTION_CLIENT_ERROR_CODE,
+                            ErrorCategory::LockConflict => TRANSACTION_EXECUTION_CLIENT_ERROR_CODE,
+                            ErrorCategory::ValidatorOverloaded => TRANSIENT_ERROR_CODE,
+                            ErrorCategory::Unavailable => INTERNAL_ERROR_CODE,
+                        };
                         ErrorObject::owned(
-                            if retriable {
-                                TRANSIENT_ERROR_CODE
-                            } else {
-                                TRANSACTION_EXECUTION_CLIENT_ERROR_CODE
-                            },
-                            format!("[MFP experimental]: {details}"),
+                            code,
+                            details,
+                            None::<()>,
+                        )
+                    }
+                    QuorumDriverError::PendingExecutionInTransactionOrchestrator => {
+                        // TODO(fastpath): Remove once traffic is 100% TD
+                        ErrorObject::owned(
+                            TRANSIENT_ERROR_CODE,
+                            "[MFP experimental]: Transaction already being processed in transaction orchestrator (most likely by quorum driver), wait for results",
                             None::<()>,
                         )
                     }

@@ -7,7 +7,7 @@
 
 use crate::symbols::{
     Symbols,
-    compilation::{MANIFEST_FILE_NAME, PrecomputedPkgInfo},
+    compilation::{CachedPackages, MANIFEST_FILE_NAME},
     get_symbols,
 };
 
@@ -22,7 +22,7 @@ use std::{
 };
 use vfs::VfsPath;
 
-use move_compiler::linters::LintLevel;
+use move_compiler::{editions::Flavor, linters::LintLevel};
 use move_package::source_package::parsed_manifest::Dependencies;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -48,10 +48,11 @@ impl SymbolicatorRunner {
     pub fn new(
         ide_files_root: VfsPath,
         symbols_map: Arc<Mutex<BTreeMap<PathBuf, Symbols>>>,
-        packages_info: Arc<Mutex<BTreeMap<PathBuf, PrecomputedPkgInfo>>>,
+        packages_info: Arc<Mutex<CachedPackages>>,
         sender: Sender<Result<BTreeMap<PathBuf, Vec<Diagnostic>>>>,
         lint: LintLevel,
         implicit_deps: Dependencies,
+        flavor: Option<Flavor>,
     ) -> Self {
         let mtx_cvar = Arc::new((Mutex::new(RunnerState::Wait), Condvar::new()));
         let thread_mtx_cvar = mtx_cvar.clone();
@@ -96,16 +97,16 @@ impl SymbolicatorRunner {
                             &mut missing_manifests,
                             sender.clone(),
                         );
-                        for (pkg_path, modified_files) in pkgs_to_analyze.into_iter() {
+                        for pkg_path in pkgs_to_analyze.into_iter() {
                             eprintln!("symbolication started");
                             match get_symbols(
                                 packages_info.clone(),
                                 ide_files_root.clone(),
                                 pkg_path.as_path(),
-                                Some(modified_files.into_iter().collect()),
                                 lint,
                                 None,
                                 implicit_deps.clone(),
+                                flavor,
                             ) {
                                 Ok((symbols_opt, lsp_diagnostics)) => {
                                     eprintln!("symbolication finished");
@@ -140,13 +141,13 @@ impl SymbolicatorRunner {
         runner
     }
 
-    /// Aggregates all starting paths by package
+    /// Collects all packages to compiler based on starting file paths passed as arguments
     fn pkgs_to_analyze(
         starting_paths: BTreeSet<PathBuf>,
         missing_manifests: &mut BTreeSet<PathBuf>,
         sender: Sender<Result<BTreeMap<PathBuf, Vec<Diagnostic>>>>,
-    ) -> BTreeMap<PathBuf, BTreeSet<PathBuf>> {
-        let mut pkgs_to_analyze: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    ) -> BTreeSet<PathBuf> {
+        let mut pkgs_to_analyze = BTreeSet::new();
         for starting_path in &starting_paths {
             let Some(root_dir) = Self::root_dir(starting_path) else {
                 if !missing_manifests.contains(starting_path) {
@@ -165,11 +166,7 @@ impl SymbolicatorRunner {
                 }
                 continue;
             };
-            // The mutext value is only set by the `on_text_document_sync_notification` handler
-            // and can only contain a valid Move file path, so we simply collect a set of Move
-            // file paths here to pass them to the symbolicator.
-            let modfied_files = pkgs_to_analyze.entry(root_dir.clone()).or_default();
-            modfied_files.insert(starting_path.clone());
+            pkgs_to_analyze.insert(root_dir.clone());
         }
         pkgs_to_analyze
     }

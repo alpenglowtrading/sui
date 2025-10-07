@@ -1,7 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
@@ -13,11 +12,13 @@ use move_core_types::annotated_value::{MoveStruct, MoveStructLayout, MoveTypeLay
 use move_core_types::language_storage::StructTag;
 use move_core_types::language_storage::TypeTag;
 use mysten_common::debug_fatal;
+use once_cell::sync::Lazy;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use serde_with::Bytes;
 
+use crate::accumulator_root::AccumulatorValue;
 use crate::base_types::{FullObjectID, FullObjectRef, MoveObjectType, ObjectIDParseError};
 use crate::coin::{Coin, CoinMetadata, TreasuryCap};
 use crate::crypto::{default_hash, deterministic_random_account_key};
@@ -216,6 +217,10 @@ impl MoveObject {
             .splice(ID_END_INDEX.., timestamp_ms.to_le_bytes());
     }
 
+    pub fn set_contents_unsafe(&mut self, contents: Vec<u8>) {
+        self.contents = contents;
+    }
+
     pub fn is_coin(&self) -> bool {
         self.type_.is_coin()
     }
@@ -362,26 +367,22 @@ impl MoveObject {
 
     /// Get the total amount of SUI embedded in `self`. Intended for testing purposes
     pub fn get_total_sui(&self, layout_resolver: &mut dyn LayoutResolver) -> Result<u64, SuiError> {
-        let balances = self.get_coin_balances(layout_resolver)?;
-        Ok(balances.get(&GAS::type_tag()).copied().unwrap_or(0))
-    }
-}
-
-// Helpers for extracting Coin<T> balances for all T
-impl MoveObject {
-    /// Get the total balances for all `Coin<T>` embedded in `self`.
-    pub fn get_coin_balances(
-        &self,
-        layout_resolver: &mut dyn LayoutResolver,
-    ) -> Result<BTreeMap<TypeTag, u64>, SuiError> {
-        // Fast path without deserialization.
-        if let Some(type_tag) = self.type_.coin_type_maybe() {
+        if self.type_.is_gas_coin() {
             let balance = self.get_coin_value_unsafe();
-            Ok(if balance > 0 {
-                BTreeMap::from([(type_tag.clone(), balance)])
-            } else {
-                BTreeMap::default()
-            })
+            Ok(balance)
+        } else if self.type_.coin_type_maybe().is_some() {
+            // It's a coin, but its not SUI
+            Ok(0)
+        } else if self.type_.is_sui_balance_accumulator_field() {
+            let value = AccumulatorValue::try_from(self)?;
+            let AccumulatorValue::U128(v) = value;
+            // Well behaved balance types can never have more than their total supply
+            // anywhere, which is 10B for SUI.
+            assert!(
+                v.value <= u64::MAX as u128,
+                "SUI balance cannot exceed u64::MAX"
+            );
+            Ok(v.value as u64)
         } else {
             let layout = layout_resolver.get_annotated_layout(&self.type_().clone().into())?;
 
@@ -391,7 +392,11 @@ impl MoveObject {
                     error: e.to_string(),
                 })?;
 
-            Ok(traversal.finish())
+            Ok(traversal
+                .finish()
+                .get(&GAS::type_tag())
+                .copied()
+                .unwrap_or(0))
         }
     }
 }
@@ -620,9 +625,30 @@ pub struct ObjectInner {
     pub storage_rebate: u64,
 }
 
-#[derive(Eq, PartialEq, Debug, Clone, Deserialize, Serialize, Hash)]
+#[derive(Eq, PartialEq, Clone, Deserialize, Serialize, Hash)]
 #[serde(from = "ObjectInner")]
 pub struct Object(Arc<ObjectInner>);
+
+fn is_object_debug_verbose() -> bool {
+    static SUI_OBJECT_DEBUG_VERBOSE: Lazy<bool> =
+        Lazy::new(|| std::env::var("SUI_OBJECT_DEBUG_VERBOSE").is_ok());
+    *SUI_OBJECT_DEBUG_VERBOSE
+}
+
+impl std::fmt::Debug for Object {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if is_object_debug_verbose() {
+            // Just call debug on ObjectInner for verbose debugging.
+            (*self.0).fmt(f)
+        } else {
+            f.debug_struct("Object")
+                .field("id", &self.id())
+                .field("version", &self.version())
+                .field("owner", &self.owner())
+                .finish()
+        }
+    }
+}
 
 impl From<ObjectInner> for Object {
     fn from(inner: ObjectInner) -> Self {

@@ -44,10 +44,9 @@ use sui_config::{
 };
 use sui_json::SuiJsonValue;
 use sui_json_rpc_types::{
-    get_new_package_obj_from_response, OwnedObjectRef, SuiExecutionStatus, SuiObjectData,
-    SuiObjectDataFilter, SuiObjectDataOptions, SuiObjectResponse, SuiObjectResponseQuery,
-    SuiRawData, SuiTransactionBlockDataAPI, SuiTransactionBlockEffects,
-    SuiTransactionBlockEffectsAPI,
+    OwnedObjectRef, SuiExecutionStatus, SuiObjectData, SuiObjectDataFilter, SuiObjectDataOptions,
+    SuiObjectResponse, SuiObjectResponseQuery, SuiRawData, SuiTransactionBlockDataAPI,
+    SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI,
 };
 use sui_keys::keystore::AccountKeystore;
 use sui_macros::sim_test;
@@ -419,7 +418,8 @@ async fn test_addresses_command() -> Result<(), anyhow::Error> {
         context
             .config
             .keystore
-            .import(None, SuiKeyPair::Ed25519(get_key_pair().1))?;
+            .import(None, SuiKeyPair::Ed25519(get_key_pair().1))
+            .await?;
     }
 
     // Print all addresses
@@ -1000,7 +1000,10 @@ async fn test_move_call_args_linter_command() -> Result<(), anyhow::Error> {
 
     assert!(resp.is_err());
     let err_string = format!("{} ", resp.err().unwrap());
-    assert!(err_string.contains("Gas price 1 under reference gas price"));
+    assert!(
+        err_string.contains("Gas price 1 under reference gas price"),
+        "Error: {err_string}"
+    );
 
     // FIXME: uncomment once we figure out what is going on with `resolve_and_type_check`
     // let err_string = format!("{} ", resp.err().unwrap());
@@ -1199,7 +1202,8 @@ async fn test_package_management_on_publish_command() -> Result<(), anyhow::Erro
                 response.effects.as_ref().unwrap().gas_object().object_id(),
                 gas_obj_id
             );
-            get_new_package_obj_from_response(&response)
+            response
+                .get_new_package_obj()
                 .ok_or_else(|| anyhow::anyhow!("No package object response"))?
         } else {
             unreachable!("Invalid response");
@@ -2432,7 +2436,8 @@ async fn test_package_management_on_upgrade_command() -> Result<(), anyhow::Erro
     .await?;
 
     // Get Original Package ID and version
-    let (expect_original_id, _, _) = get_new_package_obj_from_response(&publish_response)
+    let (expect_original_id, _, _) = publish_response
+        .get_new_package_obj()
         .ok_or_else(|| anyhow::anyhow!("No package object response"))?;
 
     // Get Upgraded Package ID and version
@@ -2442,7 +2447,8 @@ async fn test_package_management_on_upgrade_command() -> Result<(), anyhow::Erro
                 response.effects.as_ref().unwrap().gas_object().object_id(),
                 gas_obj_id
             );
-            get_new_package_obj_from_response(&response)
+            response
+                .get_new_package_obj()
                 .ok_or_else(|| anyhow::anyhow!("No package object response"))?
         } else {
             unreachable!("Invalid response");
@@ -4142,7 +4148,7 @@ async fn test_pay_sui() -> Result<(), anyhow::Error> {
     .await?;
 
     // pay sui takes the input coins and transfers from each of them (in order) the amounts to the
-    // respective receipients.
+    // respective recipients.
     // check if each recipient has one object, if the tx status is success,
     // and if the gas object used was the first object in the input coins
     // we also check if the balances of each recipient are right!

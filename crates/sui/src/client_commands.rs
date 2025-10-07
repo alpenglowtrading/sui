@@ -26,7 +26,6 @@ use fastcrypto::{
     traits::ToFromBytes,
 };
 use reqwest::StatusCode;
-use sui_replay_2 as SR2;
 
 use move_binary_format::CompiledModule;
 use move_bytecode_verifier_meter::Scope;
@@ -104,10 +103,12 @@ use tabled::{
 };
 
 use move_symbol_pool::Symbol;
+use sui_keys::key_derive;
 use sui_types::digests::ChainIdentifier;
 use tracing::{debug, info};
 
-static USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+pub(crate) static USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
 /// Only to be used within CLI
 pub const GAS_SAFE_OVERHEAD: u64 = 1000;
@@ -368,7 +369,7 @@ pub enum SuiClientCommands {
         processing: TxProcessingArgs,
     },
 
-    /// Pay SUI coins to recipients following following specified amounts, with input coins.
+    /// Pay SUI coins to recipients following specified amounts, with input coins.
     /// Length of recipients must be the same as that of amounts.
     /// The input coins also include the coin for gas payment, so no extra gas coin is required.
     PaySui {
@@ -639,61 +640,17 @@ pub enum SuiClientCommands {
     #[clap(name = "remove-address")]
     RemoveAddress { alias_or_address: String },
 
-    /// Replay a given transaction to view transaction effects. Set environment variable MOVE_VM_STEP=1 to debug.
+    /// Replay a given transaction to view transaction effects (deprecated; use `sui replay` instead)
     #[clap(name = "replay-transaction")]
-    ReplayTransaction {
-        /// The digest of the transaction to replay
-        #[arg(long, short)]
-        tx_digest: String,
+    ReplayTransaction {},
 
-        /// Log extra gas-related information
-        #[arg(long)]
-        gas_info: bool,
-
-        /// Log information about each programmable transaction command
-        #[arg(long)]
-        ptb_info: bool,
-
-        /// The output directory for the replay artifacts. Defaults `<cur_dir>/.replay/<digest>`.
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-
-        /// Whether to trace the transaction execution. Generated traces will be saved in the output
-        /// directory (or `<cur_dir>/.replay/<digest>` if none provided).
-        #[arg(long = "trace", default_value = "false")]
-        trace: bool,
-
-        /// Whether existing artifacts that were generated from a previous replay of the transaction
-        /// should be overwritten or an error raised if they already exist.
-        #[arg(long, default_value = "false")]
-        overwrite_existing: bool,
-    },
-
-    /// Replay transactions listed in a file.
+    /// Replay transactions listed in a file (deprecated; use `sui replay` instead)
     #[clap(name = "replay-batch")]
-    ReplayBatch {
-        /// The path to the file of transaction digests to replay, with one digest per line
-        #[arg(long, short)]
-        path: PathBuf,
+    ReplayBatch {},
 
-        /// If an error is encountered during a transaction, this specifies whether to terminate or continue
-        #[arg(long, short)]
-        terminate_early: bool,
-
-        /// Whether to trace the transaction execution. Generated traces will be saved in the output
-        /// directory (or `<cur_dir>/.replay/<digest>` if none provided).
-        #[arg(long = "trace", default_value = "false")]
-        trace: bool,
-
-        /// The output directory for the replay artifacts. Defaults `<cur_dir>/.replay/<digest>`.
-        #[arg(long, short)]
-        output_dir: Option<PathBuf>,
-
-        /// Whether existing artifacts that were generated from a previous replay of the transaction
-        /// should be overwritten or an error raised if they already exist.
-        #[arg(long, default_value = "false")]
-        overwrite_existing: bool,
-    },
+    /// Replay all transactions in a range of checkpoints (deprecated; use `sui replay` instead)
+    #[clap(name = "replay-checkpoint")]
+    ReplayCheckpoints {},
 }
 
 /// Arguments related to providing coins for gas payment
@@ -775,67 +732,16 @@ impl SuiClientCommands {
         context: &mut WalletContext,
     ) -> Result<SuiClientCommandResult, anyhow::Error> {
         let ret = match self {
-            SuiClientCommands::ReplayTransaction {
-                tx_digest,
-                gas_info: _,
-                ptb_info: _,
-                output_dir,
-                trace,
-                overwrite_existing,
-            } => {
-                let node = get_replay_node(context).await?;
-                let cmd2 = SR2::ReplayConfig {
-                    digest: Some(tx_digest.clone()),
-                    digests_path: None,
-                    node,
-                    trace,
-                    terminate_early: false,
-                    output_dir,
-                    show_effects: false,
-                    overwrite_existing,
-                };
-
-                let artifact_path = SR2::handle_replay_config(&cmd2, USER_AGENT).await?;
-
-                // show effects and gas
-                SR2::print_effects_or_fork(
-                    &tx_digest,
-                    &artifact_path,
-                    true,
-                    &mut std::io::stdout(),
-                )?;
-
-                // this will be displayed via trace info, so no output is needed here
+            SuiClientCommands::ReplayTransaction {} => {
+                eprintln!("This command is deprecated. Use `sui replay` instead.");
                 SuiClientCommandResult::NoOutput
             }
-            SuiClientCommands::ReplayBatch {
-                path,
-                terminate_early,
-                trace,
-                output_dir,
-                overwrite_existing,
-            } => {
-                let node = get_replay_node(context).await?;
-                let cmd2 = SR2::ReplayConfig {
-                    digest: None,
-                    digests_path: Some(path),
-                    node,
-                    trace,
-                    terminate_early,
-                    output_dir,
-                    show_effects: false,
-                    overwrite_existing,
-                };
-
-                let artifact_path = SR2::handle_replay_config(&cmd2, USER_AGENT).await?;
-
-                println!(
-                    "Replayed transactions from {}. Artifacts stored under {}",
-                    cmd2.digests_path.as_ref().unwrap().display(),
-                    artifact_path.display()
-                );
-
-                // this will be displayed via trace info, so no output is needed here
+            SuiClientCommands::ReplayBatch {} => {
+                eprintln!("This command is deprecated. Use `sui replay` instead.");
+                SuiClientCommandResult::NoOutput
+            }
+            SuiClientCommands::ReplayCheckpoints {} => {
+                eprintln!("This command is deprecated. Use `sui replay` instead.");
                 SuiClientCommandResult::NoOutput
             }
             SuiClientCommands::Addresses { sort_by_alias } => {
@@ -957,17 +863,6 @@ impl SuiClientCommands {
                 let client = context.get_client().await?;
                 let read_api = client.read_api();
                 let chain_id = read_api.get_chain_identifier().await.ok();
-                let protocol_version = read_api.get_protocol_config(None).await?.protocol_version;
-                let protocol_config = ProtocolConfig::get_for_version(
-                    protocol_version,
-                    match chain_id
-                        .as_ref()
-                        .and_then(ChainIdentifier::from_chain_short_id)
-                    {
-                        Some(chain_id) => chain_id.chain(),
-                        None => Chain::Unknown,
-                    },
-                );
 
                 check_protocol_version_and_warn(read_api).await?;
                 let package_path =
@@ -1003,7 +898,7 @@ impl SuiClientCommands {
                 .await;
 
                 // Restore original ID, then check result.
-                if let (Some(chain_id), Some(previous_id)) = (chain_id, previous_id) {
+                if let (Some(chain_id), Some(previous_id)) = (chain_id.clone(), previous_id) {
                     let _ = sui_package_management::set_package_id(
                         &package_path,
                         build_config.install_dir.clone(),
@@ -1023,6 +918,28 @@ impl SuiClientCommands {
                 let dep_ids = compiled_package.get_published_dependencies_ids();
 
                 if verify_compatibility {
+                    let protocol_version =
+                        read_api.get_protocol_config(None).await?.protocol_version;
+
+                    ensure!(
+                        ProtocolVersion::MAX >= protocol_version,
+                        "On-chain protocol version ({}) is ahead of the latest \
+                        known version ({}) in the CLI. Please update the CLI to the latest version \
+                        if you want to use --verify-compatibility flag",
+                        protocol_version.as_u64(),
+                        ProtocolVersion::MAX.as_u64()
+                    );
+
+                    let protocol_config = ProtocolConfig::get_for_version(
+                        protocol_version,
+                        match chain_id
+                            .as_ref()
+                            .and_then(ChainIdentifier::from_chain_short_id)
+                        {
+                            Some(chain_id) => chain_id.chain(),
+                            None => Chain::Unknown,
+                        },
+                    );
                     check_compatibility(
                         read_api,
                         package_id,
@@ -1604,12 +1521,14 @@ impl SuiClientCommands {
                 derivation_path,
                 word_length,
             } => {
-                let (address, phrase, scheme) = context.config.keystore.generate(
-                    key_scheme,
-                    alias.clone(),
-                    derivation_path,
-                    word_length,
-                )?;
+                let (address, keypair, scheme, phrase) =
+                    key_derive::generate_new_key(key_scheme, derivation_path, word_length)
+                        .map_err(|e| anyhow!("Failed to generate new key: {}", e))?;
+                context
+                    .config
+                    .keystore
+                    .import(alias.clone(), keypair)
+                    .await?;
 
                 let alias = match alias {
                     Some(x) => x,
@@ -1627,9 +1546,9 @@ impl SuiClientCommands {
             SuiClientCommands::RemoveAddress { alias_or_address } => {
                 let identity = KeyIdentity::from_str(&alias_or_address)
                     .map_err(|e| anyhow!("Invalid address or alias: {}", e))?;
-                let address: SuiAddress = context.config.keystore.get_by_identity(identity)?;
+                let address: SuiAddress = context.config.keystore.get_by_identity(&identity)?;
 
-                context.config.keystore.remove(address)?;
+                context.config.keystore.remove(address).await?;
 
                 SuiClientCommandResult::RemoveAddress(RemoveAddressOutput { alias_or_address })
             }
@@ -3398,7 +3317,8 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
         let mut signatures = vec![context
             .config
             .keystore
-            .sign_secure(&signer, &tx_data, Intent::sui_transaction())?
+            .sign_secure(&signer, &tx_data, Intent::sui_transaction())
+            .await?
             .into()];
 
         if let Some(gas_sponsor) = gas_sponsor {
@@ -3407,7 +3327,8 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
                     context
                         .config
                         .keystore
-                        .sign_secure(&gas_sponsor, &tx_data, Intent::sui_transaction())?
+                        .sign_secure(&gas_sponsor, &tx_data, Intent::sui_transaction())
+                        .await?
                         .into(),
                 );
             }
@@ -3601,20 +3522,4 @@ pub(crate) async fn pkg_tree_shake(
     });
 
     Ok(())
-}
-
-async fn get_replay_node(context: &mut WalletContext) -> Result<SR2::Node, anyhow::Error> {
-    let chain_id = context
-        .get_client()
-        .await?
-        .read_api()
-        .get_chain_identifier()
-        .await?;
-    let chain_id = ChainIdentifier::from_chain_short_id(&chain_id)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported chain identifier for replay -- only testnet and mainnet are supported currently: {chain_id}"))?;
-    Ok(match chain_id.chain() {
-        Chain::Mainnet => SR2::Node::Mainnet,
-        Chain::Testnet => SR2::Node::Testnet,
-        Chain::Unknown => bail!("Unsupported chain identifier for replay -- only testnet and mainnet are supported currently"),
-    })
 }

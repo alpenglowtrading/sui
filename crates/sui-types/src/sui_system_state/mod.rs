@@ -25,6 +25,7 @@ use std::fmt;
 use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
 
 pub mod epoch_start_sui_system_state;
+pub mod mock;
 pub mod sui_system_state_inner_v1;
 pub mod sui_system_state_inner_v2;
 pub mod sui_system_state_summary;
@@ -325,7 +326,7 @@ pub fn get_validator_from_table<K>(
     key: &K,
 ) -> Result<SuiValidatorSummary, SuiError>
 where
-    K: MoveTypeTagTrait + Serialize + DeserializeOwned + fmt::Debug,
+    K: Clone + MoveTypeTagTrait + Serialize + DeserializeOwned + fmt::Debug,
 {
     let field: ValidatorWrapper = get_dynamic_field_from_store(object_store, table_id, key)
         .map_err(|err| {

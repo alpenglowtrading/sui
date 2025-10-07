@@ -24,12 +24,14 @@ pub struct VerifierConfig {
     pub max_back_edges_per_function: Option<usize>,
     pub max_back_edges_per_module: Option<usize>,
     pub max_basic_blocks_in_script: Option<usize>,
-    pub max_idenfitier_len: Option<u64>,
+    pub max_identifier_len: Option<u64>,
     pub disallow_self_identifier: bool,
     pub allow_receiving_object_id: bool,
     pub reject_mutable_random_on_entry_functions: bool,
     pub bytecode_version: u32,
     pub max_variants_in_enum: Option<u64>,
+    pub additional_borrow_checks: bool,
+    pub better_loader_errors: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,12 +71,14 @@ impl Default for VerifierConfig {
             max_back_edges_per_module: None,
             max_basic_blocks_in_script: None,
             max_constant_vector_len: Some(DEFAULT_MAX_CONSTANT_VECTOR_LEN),
-            max_idenfitier_len: Some(DEFAULT_MAX_IDENTIFIER_LENGTH),
+            max_identifier_len: Some(DEFAULT_MAX_IDENTIFIER_LENGTH),
             disallow_self_identifier: false,
             allow_receiving_object_id: true,
             reject_mutable_random_on_entry_functions: true,
             bytecode_version: VERSION_MAX,
             max_variants_in_enum: Some(DEFAULT_MAX_VARIANTS),
+            additional_borrow_checks: true,
+            better_loader_errors: true,
         }
     }
 }

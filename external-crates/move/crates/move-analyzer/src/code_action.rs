@@ -9,7 +9,7 @@ use crate::{
     context::Context,
     symbols::{
         Symbols,
-        compilation::{CompiledPkgInfo, PrecomputedPkgInfo, get_compiled_pkg},
+        compilation::{CachedPackages, CompiledPkgInfo, get_compiled_pkg},
         cursor::{ChainInfo, CursorContext},
         runner::SymbolicatorRunner,
     },
@@ -23,7 +23,7 @@ use lsp_types::{
 };
 use move_symbol_pool::Symbol;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -33,6 +33,7 @@ use url::Url;
 use vfs::VfsPath;
 
 use move_compiler::{
+    editions::Flavor,
     expansion::ast::ModuleIdent,
     linters::LintLevel,
     parser::ast::{LeadingNameAccess_, NameAccessChain_},
@@ -84,8 +85,9 @@ pub fn on_code_action_request(
     context: &Context,
     request: &Request,
     ide_files_root: VfsPath,
-    pkg_dependencies: Arc<Mutex<BTreeMap<PathBuf, PrecomputedPkgInfo>>>,
+    pkg_dependencies: Arc<Mutex<CachedPackages>>,
     implicit_deps: Dependencies,
+    flavor: Option<Flavor>,
 ) {
     let response = Response::new_ok(
         request.id.clone(),
@@ -95,6 +97,7 @@ pub fn on_code_action_request(
             ide_files_root,
             pkg_dependencies,
             implicit_deps,
+            flavor,
         ),
     );
     eprintln!("code_action_request: {:?}", request);
@@ -108,8 +111,9 @@ fn access_chain_autofix_actions(
     context: &Context,
     request: &Request,
     ide_files_root: VfsPath,
-    pkg_dependencies: Arc<Mutex<BTreeMap<PathBuf, PrecomputedPkgInfo>>>,
+    pkg_dependencies: Arc<Mutex<CachedPackages>>,
     implicit_deps: Dependencies,
+    flavor: Option<Flavor>,
 ) -> Vec<CodeAction> {
     let mut code_actions = vec![];
 
@@ -141,9 +145,9 @@ fn access_chain_autofix_actions(
         pkg_dependencies.clone(),
         ide_files_root,
         &pkg_path,
-        Some(vec![]),
         LintLevel::None,
         implicit_deps,
+        flavor,
     ) else {
         return code_actions;
     };

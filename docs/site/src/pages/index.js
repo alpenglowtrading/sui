@@ -59,7 +59,7 @@ export default function Home() {
           <HomeCard title="Validators and Node operators">
             <Link
               className={styles.cardLink}
-              to="./guides/operator/validator-config"
+              to="./guides/operator/validator/validator-config"
             >
               Validator configuration
             </Link>
@@ -117,6 +117,12 @@ export default function Home() {
               to="https://sui.directory/?_project_type=api%2Cdeveloper-tools%2Cinfrastructure%2Csdk"
             >
               Sui ecosystem directory
+            </Link>
+            <Link
+              className={styles.cardLink}
+              to="/references/awesome-sui"
+            >
+              Awesome Sui
             </Link>
             <Link className={styles.cardLink} to="https://blog.sui.io/">
               Sui blog

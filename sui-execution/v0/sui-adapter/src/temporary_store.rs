@@ -3,7 +3,7 @@
 
 use crate::gas_charger::GasCharger;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::committee::EpochId;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
@@ -28,6 +28,7 @@ use sui_types::{
         BackingPackageStore, ChildObjectResolver, ObjectChange, ParentSync, Storage, WriteKind,
     },
     transaction::InputObjects,
+    TypeTag,
 };
 use sui_types::{is_system_package, SUI_SYSTEM_STATE_OBJECT_ID};
 
@@ -1022,9 +1023,15 @@ impl Storage for TemporaryStore<'_> {
 
     fn check_coin_deny_list(
         &self,
-        _written_objects: &BTreeMap<ObjectID, Object>,
+        _receiving_funds_type_and_owners: BTreeMap<TypeTag, BTreeSet<SuiAddress>>,
     ) -> DenyListResult {
         unreachable!("Coin denylist v2 is not supported in sui-execution v0");
+    }
+
+    fn record_generated_object_ids(&mut self, _generated_ids: BTreeSet<ObjectID>) {
+        unreachable!(
+            "Generated object IDs are not recorded in ExecutionResults in sui-execution v0"
+        );
     }
 }
 

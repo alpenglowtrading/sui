@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use crate::execution_scheduler::balance_withdraw_scheduler::{
     balance_read::AccountBalanceRead, naive_scheduler::NaiveBalanceWithdrawScheduler,
@@ -59,22 +59,22 @@ impl BalanceWithdrawScheduler {
     pub fn new(
         balance_read: Arc<dyn AccountBalanceRead>,
         starting_accumulator_version: SequenceNumber,
-    ) -> Arc<Self> {
+    ) -> Self {
         let inner = NaiveBalanceWithdrawScheduler::new(balance_read, starting_accumulator_version);
         let (withdraw_sender, withdraw_receiver) =
             unbounded_channel("withdraw_scheduler_withdraws");
         let (settlement_sender, settlement_receiver) =
             unbounded_channel("withdraw_scheduler_settlements");
-        let scheduler = Arc::new(Self {
+        let scheduler = Self {
             inner,
             withdraw_sender,
             settlement_sender,
-        });
+        };
         tokio::spawn(scheduler.clone().process_withdraw_task(withdraw_receiver));
         tokio::spawn(
             scheduler
                 .clone()
-                .process_settlement_task(settlement_receiver, starting_accumulator_version),
+                .process_settlement_task(settlement_receiver),
         );
         scheduler
     }
@@ -98,10 +98,8 @@ impl BalanceWithdrawScheduler {
         receivers
     }
 
-    /// This function is called whenever a new version of the accumulator root object is committed
-    /// in the writeback cache.
-    /// It is OK to call this function out of order, as the implementation will handle the out of order calls.
-    /// It must be called once for each version of the accumulator root object.
+    /// This function is called whenever a settlement transaction is executed.
+    /// It is only called from checkpoint builder, once for each accumulator version, in order.
     pub fn settle_balances(&self, settlement: BalanceSettlement) {
         if let Err(err) = self.settlement_sender.send(settlement) {
             tracing::error!("Failed to send balance settlement: {:?}", err);
@@ -109,31 +107,22 @@ impl BalanceWithdrawScheduler {
     }
 
     async fn process_withdraw_task(
-        self: Arc<Self>,
+        self,
         mut withdraw_receiver: UnboundedReceiver<WithdrawReservations>,
     ) {
         while let Some(event) = withdraw_receiver.recv().await {
             self.inner.schedule_withdraws(event).await;
         }
+        tracing::info!("Balance withdraw receiver closed");
     }
 
     async fn process_settlement_task(
-        self: Arc<Self>,
+        self,
         mut settlement_receiver: UnboundedReceiver<BalanceSettlement>,
-        starting_accumulator_version: SequenceNumber,
     ) {
-        let mut expected_version = starting_accumulator_version.next();
-        let mut pending_settlements = BTreeMap::new();
         while let Some(settlement) = settlement_receiver.recv().await {
-            debug!(
-                "process_settlement_task received version: {:?}, expected version: {:?}",
-                settlement.accumulator_version, expected_version
-            );
-            pending_settlements.insert(settlement.accumulator_version, settlement);
-            while let Some(settlement) = pending_settlements.remove(&expected_version) {
-                expected_version = settlement.accumulator_version.next();
-                self.inner.settle_balances(settlement).await;
-            }
+            self.inner.settle_balances(settlement).await;
         }
+        tracing::info!("Balance settlement receiver closed");
     }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::File,
     io::{self, BufWriter},
     path::{Path, PathBuf},
@@ -17,14 +17,14 @@ use move_analyzer::{
     inlay_hints::inlay_hints_internal,
     symbols::{
         Symbols,
-        compilation::{CompiledPkgInfo, SymbolsComputationData, get_compiled_pkg},
+        compilation::{CachedPackages, CompiledPkgInfo, SymbolsComputationData, get_compiled_pkg},
         compute_symbols, compute_symbols_parsed_program, compute_symbols_pre_process,
         requests::{def_info_doc_string, maybe_convert_for_guard},
         use_def::UseDefMap,
     },
 };
 use move_command_line_common::testing::insta_assert;
-use move_compiler::linters::LintLevel;
+use move_compiler::{editions::Flavor, linters::LintLevel};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use vfs::{MemoryFS, VfsPath};
@@ -437,47 +437,39 @@ fn completion_test(
 
 fn initial_symbols(
     project: String,
-    files: &BTreeSet<&String>,
 ) -> datatest_stable::Result<(PathBuf, CompiledPkgInfo, Symbols)> {
     let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut project_path = base_path.clone();
     project_path.push(project);
 
     let ide_files_root: VfsPath = MemoryFS::new().into();
-    let pkg_deps = Arc::new(Mutex::new(BTreeMap::new()));
+    let pkg_deps = Arc::new(Mutex::new(CachedPackages::new()));
 
-    let (mut compiled_pkg_info_opt, _) = get_compiled_pkg(
-        pkg_deps.clone(),
-        ide_files_root.clone(),
-        project_path.as_path(),
-        None,
-        LintLevel::None,
-        BTreeMap::new(),
-    )?;
-
-    if let Some(f) = files.first() {
-        let mod_file = project_path.join("sources").join(f);
-        (compiled_pkg_info_opt, _) = get_compiled_pkg(
+    // Similarly to `get_symbols`, we retry to exercise caching
+    let mut should_retry = true;
+    loop {
+        let (compiled_pkg_info_opt, _) = get_compiled_pkg(
             pkg_deps.clone(),
             ide_files_root.clone(),
             project_path.as_path(),
-            Some(vec![mod_file]),
             LintLevel::None,
             BTreeMap::new(),
+            Some(Flavor::Sui),
         )?;
+        let compiled_pkg_info = compiled_pkg_info_opt.ok_or("PACKAGE COMPILATION FAILED")?;
+        let symbols = compute_symbols(pkg_deps.clone(), compiled_pkg_info.clone(), None);
+        if !should_retry {
+            return Ok((project_path, compiled_pkg_info, symbols));
+        }
+        should_retry = false;
     }
-
-    let compiled_pkg_info = compiled_pkg_info_opt.ok_or("PACKAGE COMPILATION FAILED")?;
-    let symbols = compute_symbols(pkg_deps.clone(), compiled_pkg_info.clone(), None);
-
-    Ok((project_path, compiled_pkg_info, symbols))
 }
 
 fn use_def_test_suite(
     project: String,
     file_tests: BTreeMap<String, Vec<UseDefTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, _, symbols) = initial_symbols(project, &file_tests.keys().collect())?;
+    let (project_path, _, symbols) = initial_symbols(project)?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -511,8 +503,7 @@ fn auto_completion_test_suite(
     project: String,
     file_tests: BTreeMap<String, Vec<AutoCompletionTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, mut compiled_pkg_info, mut symbols) =
-        initial_symbols(project, &file_tests.keys().collect())?;
+    let (project_path, mut compiled_pkg_info, mut symbols) = initial_symbols(project)?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -541,8 +532,7 @@ fn auto_import_test_suite(
     project: String,
     file_tests: BTreeMap<String, Vec<AutoImportTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, mut compiled_pkg_info, mut symbols) =
-        initial_symbols(project, &file_tests.keys().collect())?;
+    let (project_path, mut compiled_pkg_info, mut symbols) = initial_symbols(project)?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -571,8 +561,7 @@ fn cursor_test_suite(
     project: String,
     file_tests: BTreeMap<String, Vec<CursorTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, compiled_pkg_info, mut symbols) =
-        initial_symbols(project, &file_tests.keys().collect())?;
+    let (project_path, compiled_pkg_info, mut symbols) = initial_symbols(project)?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -600,7 +589,7 @@ fn hint_test_suite(
     project: String,
     file_tests: BTreeMap<String, Vec<HintTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, _, symbols) = initial_symbols(project, &file_tests.keys().collect())?;
+    let (project_path, _, symbols) = initial_symbols(project)?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -629,8 +618,7 @@ fn access_chain_quick_fix_test_suite(
     project: String,
     file_tests: BTreeMap<String, Vec<AccessChainQuickFixTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, mut compiled_pkg_info, mut symbols) =
-        initial_symbols(project, &file_tests.keys().collect())?;
+    let (project_path, mut compiled_pkg_info, mut symbols) = initial_symbols(project)?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();

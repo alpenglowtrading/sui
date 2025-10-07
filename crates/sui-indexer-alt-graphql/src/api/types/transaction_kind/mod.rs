@@ -11,6 +11,7 @@ use self::{
     change_epoch::ChangeEpochTransaction,
     consensus_commit_prologue::ConsensusCommitPrologueTransaction,
     end_of_epoch::EndOfEpochTransaction, genesis::GenesisTransaction,
+    programmable::ProgrammableTransaction, programmable_system::ProgrammableSystemTransaction,
     randomness_state_update::RandomnessStateUpdateTransaction,
 };
 
@@ -19,6 +20,8 @@ pub(crate) mod change_epoch;
 pub(crate) mod consensus_commit_prologue;
 pub(crate) mod end_of_epoch;
 pub(crate) mod genesis;
+pub(crate) mod programmable;
+pub(crate) mod programmable_system;
 pub(crate) mod randomness_state_update;
 
 /// Different types of transactions that can be executed on the Sui network.
@@ -30,6 +33,9 @@ pub enum TransactionKind {
     RandomnessStateUpdate(RandomnessStateUpdateTransaction),
     AuthenticatorStateUpdate(AuthenticatorStateUpdateTransaction),
     EndOfEpoch(EndOfEpochTransaction),
+    Programmable(ProgrammableTransaction),
+    // GraphQL Union does not allow multiple variants with the same type
+    ProgrammableSystem(ProgrammableSystemTransaction),
 }
 
 impl TransactionKind {
@@ -65,8 +71,15 @@ impl TransactionKind {
             K::EndOfEpochTransaction(eoe) => {
                 Some(T::EndOfEpoch(EndOfEpochTransaction { native: eoe, scope }))
             }
-            // Other types will return None for now
-            _ => None,
+            K::ProgrammableTransaction(pt) => Some(T::Programmable(ProgrammableTransaction {
+                native: pt,
+                scope,
+            })),
+            K::ProgrammableSystemTransaction(pt) => {
+                Some(T::ProgrammableSystem(ProgrammableSystemTransaction {
+                    inner: ProgrammableTransaction { native: pt, scope },
+                }))
+            }
         }
     }
 }

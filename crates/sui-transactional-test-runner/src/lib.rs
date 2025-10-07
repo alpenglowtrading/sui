@@ -4,6 +4,7 @@
 //! This module contains the transactional test runner instantiation for the Sui adapter
 
 pub mod args;
+pub mod cursor;
 pub mod offchain_state;
 pub mod programmable_transaction_test_parser;
 mod simulator_persisted_store;
@@ -409,6 +410,13 @@ impl ReadStore for ValidatorWithFullnode {
         _digest: &CheckpointContentsDigest,
     ) -> Option<sui_types::messages_checkpoint::FullCheckpointContents> {
         todo!()
+    }
+
+    fn get_unchanged_loaded_runtime_objects(
+        &self,
+        _digest: &TransactionDigest,
+    ) -> Option<Vec<sui_types::storage::ObjectKey>> {
+        None
     }
 }
 

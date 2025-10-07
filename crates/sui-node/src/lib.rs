@@ -8,13 +8,13 @@ use anemo_tower::trace::DefaultMakeSpan;
 use anemo_tower::trace::DefaultOnFailure;
 use anemo_tower::trace::TraceLayer;
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use fastcrypto_zkp::bn254::zk_login::JwkId;
 use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
 use futures::future::BoxFuture;
 use mysten_common::debug_fatal;
-use mysten_network::server::SUI_TLS_SERVER_NAME;
 use prometheus::Registry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -38,7 +38,9 @@ use sui_core::consensus_adapter::ConsensusClient;
 use sui_core::consensus_manager::UpdatableConsensusClient;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::build_execution_cache;
-use sui_core::execution_scheduler::ExecutionSchedulerAPI;
+use sui_network::validator::server::SUI_TLS_SERVER_NAME;
+use sui_types::full_checkpoint_content::Checkpoint;
+
 use sui_core::execution_scheduler::SchedulingSource;
 use sui_core::global_state_hasher::GlobalStateHashMetrics;
 use sui_core::storage::RestReadStore;
@@ -50,9 +52,10 @@ use sui_rpc_api::RpcMetrics;
 use sui_rpc_api::ServerVersion;
 use sui_types::base_types::ConciseableName;
 use sui_types::crypto::RandomnessRound;
-use sui_types::digests::ChainIdentifier;
+use sui_types::digests::{
+    ChainIdentifier, CheckpointDigest, TransactionDigest, TransactionEffectsDigest,
+};
 use sui_types::executable_transaction::VerifiedExecutableTransaction;
-use sui_types::full_checkpoint_content::CheckpointData;
 use sui_types::messages_consensus::AuthorityCapabilitiesV2;
 use sui_types::messages_consensus::ConsensusTransactionKind;
 use sui_types::sui_system_state::SuiSystemState;
@@ -60,7 +63,7 @@ use sui_types::transaction::VerifiedCertificate;
 use tap::tap::TapFallible;
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
 use tracing::{debug, error, warn};
 use tracing::{error_span, info, Instrument};
@@ -68,15 +71,16 @@ use tracing::{error_span, info, Instrument};
 use fastcrypto_zkp::bn254::zk_login::JWK;
 pub use handle::SuiNodeHandle;
 use mysten_metrics::{spawn_monitored_task, RegistryService};
-use mysten_network::server::ServerBuilder;
 use mysten_service::server_timing::server_timing_middleware;
 use sui_config::node::{DBCheckpointConfig, RunWithRange};
+use sui_config::node::{ForkCrashBehavior, ForkRecoveryConfig};
 use sui_config::node_config_metrics::NodeConfigMetrics;
 use sui_config::{ConsensusConfig, NodeConfig};
 use sui_core::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 use sui_core::authority::epoch_start_configuration::EpochStartConfigTrait;
 use sui_core::authority::epoch_start_configuration::EpochStartConfiguration;
+use sui_core::authority::submitted_transaction_cache::SubmittedTransactionCacheMetrics;
 use sui_core::authority_aggregator::{AuthAggMetrics, AuthorityAggregator};
 use sui_core::authority_server::{ValidatorService, ValidatorServiceMetrics};
 use sui_core::checkpoints::checkpoint_executor::metrics::CheckpointExecutorMetrics;
@@ -88,7 +92,7 @@ use sui_core::checkpoints::{
 use sui_core::consensus_adapter::{
     CheckConnection, ConnectionMonitorStatus, ConsensusAdapter, ConsensusAdapterMetrics,
 };
-use sui_core::consensus_manager::{ConsensusManager, ConsensusManagerTrait};
+use sui_core::consensus_manager::ConsensusManager;
 use sui_core::consensus_throughput_calculator::{
     ConsensusThroughputCalculator, ConsensusThroughputProfiler, ThroughputProfileRanges,
 };
@@ -124,6 +128,7 @@ use sui_network::api::ValidatorServer;
 use sui_network::discovery;
 use sui_network::discovery::TrustedPeerChangeEvent;
 use sui_network::state_sync;
+use sui_network::validator::server::ServerBuilder;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_snapshot::uploader::StateSnapshotUploader;
 use sui_storage::{
@@ -138,7 +143,6 @@ use sui_types::error::{SuiError, SuiResult};
 use sui_types::messages_consensus::{
     check_total_jwk_size, AuthorityCapabilitiesV1, ConsensusTransaction,
 };
-use sui_types::quorum_driver_types::QuorumDriverEffectsQueueResult;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemState;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::sui_system_state::SuiSystemStateTrait;
@@ -158,8 +162,6 @@ pub struct ValidatorComponents {
     consensus_manager: Arc<ConsensusManager>,
     consensus_store_pruner: ConsensusStorePruner,
     consensus_adapter: Arc<ConsensusAdapter>,
-    // Keeping the handle to the checkpoint service tasks to shut them down during reconfiguration.
-    checkpoint_service_tasks: JoinSet<()>,
     checkpoint_metrics: Arc<CheckpointMetrics>,
     sui_tx_validator_metrics: Arc<SuiTxValidatorMetrics>,
 }
@@ -228,12 +230,14 @@ mod simulator {
 pub use simulator::set_jwk_injector;
 #[cfg(msim)]
 use simulator::*;
-use sui_core::authority::authority_store_pruner::ObjectsCompactionFilter;
+use sui_core::authority::authority_store_pruner::{ObjectsCompactionFilter, PrunerWatermarks};
 use sui_core::{
     consensus_handler::ConsensusHandlerInitializer, safe_client::SafeClientMetricsBase,
     validator_tx_finalizer::ValidatorTxFinalizer,
 };
 use sui_types::execution_config_utils::to_binary_config;
+
+const DEFAULT_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct SuiNode {
     config: NodeConfig,
@@ -247,6 +251,7 @@ pub struct SuiNode {
     transaction_orchestrator: Option<Arc<TransactionOrchestrator<NetworkAuthorityClient>>>,
     registry_service: RegistryService,
     metrics: Arc<SuiNodeMetrics>,
+    checkpoint_metrics: Arc<CheckpointMetrics>,
 
     _discovery: discovery::Handle,
     _connection_monitor_handle: consensus_core::ConnectionMonitorHandle,
@@ -279,7 +284,7 @@ pub struct SuiNode {
     // update will automatically propagate to other uses.
     auth_agg: Arc<ArcSwap<AuthorityAggregator<NetworkAuthorityClient>>>,
 
-    subscription_service_checkpoint_sender: Option<tokio::sync::mpsc::Sender<CheckpointData>>,
+    subscription_service_checkpoint_sender: Option<tokio::sync::mpsc::Sender<Checkpoint>>,
 }
 
 impl fmt::Debug for SuiNode {
@@ -426,7 +431,7 @@ impl SuiNode {
                                     info!("Submitting JWK to consensus: {:?}", id);
 
                                     let txn = ConsensusTransaction::new_jwk_fetched(authority, id, jwk);
-                                    consensus_adapter.submit(txn, None, &epoch_store, None)
+                                    consensus_adapter.submit(txn, None, &epoch_store, None, None)
                                         .tap_err(|e| warn!("Error when submitting JWKs to consensus {:?}", e))
                                         .ok();
                                 }
@@ -483,6 +488,21 @@ impl SuiNode {
             None,
         ));
 
+        let pruner_watermarks = Arc::new(PrunerWatermarks::default());
+        let checkpoint_store = CheckpointStore::new(
+            &config.db_path().join("checkpoints"),
+            pruner_watermarks.clone(),
+        );
+        let checkpoint_metrics = CheckpointMetrics::new(&registry_service.default_registry());
+
+        Self::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            is_validator,
+            config.fork_recovery.as_ref(),
+        )
+        .await?;
+
         let mut pruner_db = None;
         if config
             .authority_store_pruning_config
@@ -505,12 +525,12 @@ impl SuiNode {
         let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(
             &config.db_path().join("store"),
             Some(perpetual_tables_options),
+            Some(pruner_watermarks.epoch_id.clone()),
         ));
         let is_genesis = perpetual_tables
             .database_is_empty()
             .expect("Database read should not fail at init.");
 
-        let checkpoint_store = CheckpointStore::new(&config.db_path().join("checkpoints"));
         let backpressure_manager =
             BackpressureManager::new_from_checkpoint_store(&checkpoint_store);
 
@@ -571,6 +591,9 @@ impl SuiNode {
                 .get_highest_executed_checkpoint_seq_number()
                 .expect("checkpoint store read cannot fail")
                 .unwrap_or(0),
+            Arc::new(SubmittedTransactionCacheMetrics::new(
+                &registry_service.default_registry(),
+            )),
         )?;
 
         info!("created epoch store");
@@ -746,6 +769,7 @@ impl SuiNode {
             pruner_db,
             config.policy_config.clone(),
             config.firewall_config.clone(),
+            pruner_watermarks,
         )
         .await;
         // ensure genesis txn was executed
@@ -864,6 +888,7 @@ impl SuiNode {
                     connection_monitor_status.clone(),
                     &registry_service,
                     sui_node_metrics.clone(),
+                    checkpoint_metrics.clone(),
                 ),
                 Self::reexecute_pending_consensus_certs(&epoch_store, &state,)
             );
@@ -890,6 +915,7 @@ impl SuiNode {
             transaction_orchestrator,
             registry_service,
             metrics: sui_node_metrics,
+            checkpoint_metrics,
 
             _discovery: discovery_handle,
             _connection_monitor_handle: connection_monitor_handle,
@@ -1222,6 +1248,7 @@ impl SuiNode {
         connection_monitor_status: Arc<ConnectionMonitorStatus>,
         registry_service: &RegistryService,
         sui_node_metrics: Arc<SuiNodeMetrics>,
+        checkpoint_metrics: Arc<CheckpointMetrics>,
     ) -> Result<ValidatorComponents> {
         let mut config_clone = config.clone();
         let consensus_config = config_clone
@@ -1255,7 +1282,6 @@ impl SuiNode {
             &registry_service.default_registry(),
         );
 
-        let checkpoint_metrics = CheckpointMetrics::new(&registry_service.default_registry());
         let sui_tx_validator_metrics =
             SuiTxValidatorMetrics::new(&registry_service.default_registry());
 
@@ -1385,6 +1411,7 @@ impl SuiNode {
             state.clone(),
             checkpoint_service.clone(),
             epoch_store.clone(),
+            consensus_adapter.clone(),
             low_scoring_authorities,
             throughput_calculator,
             backpressure_manager,
@@ -1422,7 +1449,9 @@ impl SuiNode {
         } else {
             Some(replay_waiter)
         };
-        let checkpoint_service_tasks = checkpoint_service.spawn(replay_waiter).await;
+        checkpoint_service
+            .spawn(epoch_store.clone(), replay_waiter)
+            .await;
 
         if epoch_store.authenticator_state_enabled() {
             Self::start_jwk_updater(
@@ -1440,7 +1469,6 @@ impl SuiNode {
             consensus_manager,
             consensus_store_pruner,
             consensus_adapter,
-            checkpoint_service_tasks,
             checkpoint_metrics,
             sui_tx_validator_metrics,
         })
@@ -1535,6 +1563,9 @@ impl SuiNode {
         );
 
         let mut server_conf = mysten_network::config::Config::new();
+        server_conf.connect_timeout = Some(DEFAULT_GRPC_CONNECT_TIMEOUT);
+        server_conf.http2_keepalive_interval = Some(DEFAULT_GRPC_CONNECT_TIMEOUT);
+        server_conf.http2_keepalive_timeout = Some(DEFAULT_GRPC_CONNECT_TIMEOUT);
         server_conf.global_concurrency_limit = config.grpc_concurrency_limit;
         server_conf.load_shed = config.grpc_load_shed;
         let mut server_builder =
@@ -1715,15 +1746,6 @@ impl SuiNode {
         self.transaction_orchestrator.clone()
     }
 
-    pub fn subscribe_to_transaction_orchestrator_effects(
-        &self,
-    ) -> Result<tokio::sync::broadcast::Receiver<QuorumDriverEffectsQueueResult>> {
-        self.transaction_orchestrator
-            .as_ref()
-            .map(|to| to.subscribe_to_effects_queue())
-            .ok_or_else(|| anyhow::anyhow!("Transaction Orchestrator is not enabled in this node."))
-    }
-
     /// This function awaits the completion of checkpoint execution of the current epoch,
     /// after which it initiates reconfiguration of the entire system.
     pub async fn monitor_reconfiguration(
@@ -1794,9 +1816,13 @@ impl SuiNode {
                     ))
                 };
                 info!(?transaction, "submitting capabilities to consensus");
-                components
-                    .consensus_adapter
-                    .submit(transaction, None, &cur_epoch_store, None)?;
+                components.consensus_adapter.submit(
+                    transaction,
+                    None,
+                    &cur_epoch_store,
+                    None,
+                    None,
+                )?;
             }
 
             let stop_condition = checkpoint_executor.run_epoch(run_with_range).await;
@@ -1895,25 +1921,11 @@ impl SuiNode {
                 consensus_manager,
                 consensus_store_pruner,
                 consensus_adapter,
-                mut checkpoint_service_tasks,
                 checkpoint_metrics,
                 sui_tx_validator_metrics,
             }) = validator_components_lock_guard.take()
             {
                 info!("Reconfiguring the validator.");
-                // Cancel the old checkpoint service tasks.
-                // Waiting for checkpoint builder to finish gracefully is not possible, because it
-                // may wait on transactions while consensus on peers have already shut down.
-                checkpoint_service_tasks.abort_all();
-                while let Some(result) = checkpoint_service_tasks.join_next().await {
-                    if let Err(err) = result {
-                        if err.is_panic() {
-                            std::panic::resume_unwind(err.into_panic());
-                        }
-                        warn!("Error in checkpoint service task: {:?}", err);
-                    }
-                }
-                info!("Checkpoint service has shut down.");
 
                 consensus_manager.shutdown().await;
                 info!("Consensus has shut down.");
@@ -1990,6 +2002,7 @@ impl SuiNode {
                         self.connection_monitor_status.clone(),
                         &self.registry_service,
                         self.metrics.clone(),
+                        self.checkpoint_metrics.clone(),
                     )
                     .await?;
 
@@ -2096,6 +2109,245 @@ impl SuiNode {
 
     pub fn randomness_handle(&self) -> randomness::Handle {
         self.randomness_handle.clone()
+    }
+
+    /// Get a short prefix of a digest for metric labels
+    fn get_digest_prefix(digest: impl std::fmt::Display) -> String {
+        let digest_str = digest.to_string();
+        if digest_str.len() >= 8 {
+            digest_str[0..8].to_string()
+        } else {
+            digest_str
+        }
+    }
+
+    /// Check for previously detected forks and handle them appropriately.
+    /// For validators with fork recovery config, clear the fork if it matches the recovery config.
+    /// For all other cases, block node startup if a fork is detected.
+    async fn check_and_recover_forks(
+        checkpoint_store: &CheckpointStore,
+        checkpoint_metrics: &CheckpointMetrics,
+        is_validator: bool,
+        fork_recovery: Option<&ForkRecoveryConfig>,
+    ) -> Result<()> {
+        // Fork detection and recovery is only relevant for validators
+        // Fullnodes should sync from validators and don't need fork checking
+        if !is_validator {
+            return Ok(());
+        }
+
+        // Try to recover from forks if recovery config is provided
+        if let Some(recovery) = fork_recovery {
+            Self::try_recover_checkpoint_fork(checkpoint_store, recovery)?;
+            Self::try_recover_transaction_fork(checkpoint_store, recovery)?;
+        }
+
+        if let Some((checkpoint_seq, checkpoint_digest)) = checkpoint_store
+            .get_checkpoint_fork_detected()
+            .map_err(|e| {
+                error!("Failed to check for checkpoint fork: {:?}", e);
+                e
+            })?
+        {
+            Self::handle_checkpoint_fork(
+                checkpoint_seq,
+                checkpoint_digest,
+                checkpoint_metrics,
+                fork_recovery,
+            )
+            .await?;
+        }
+        if let Some((tx_digest, expected_effects, actual_effects)) = checkpoint_store
+            .get_transaction_fork_detected()
+            .map_err(|e| {
+                error!("Failed to check for transaction fork: {:?}", e);
+                e
+            })?
+        {
+            Self::handle_transaction_fork(
+                tx_digest,
+                expected_effects,
+                actual_effects,
+                checkpoint_metrics,
+                fork_recovery,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    fn try_recover_checkpoint_fork(
+        checkpoint_store: &CheckpointStore,
+        recovery: &ForkRecoveryConfig,
+    ) -> Result<()> {
+        // If configured overrides include a checkpoint whose locally computed digest mismatches,
+        // clear locally computed checkpoints from that sequence (inclusive).
+        for (seq, expected_digest_str) in &recovery.checkpoint_overrides {
+            let Ok(expected_digest) = CheckpointDigest::from_str(expected_digest_str) else {
+                anyhow::bail!(
+                    "Invalid checkpoint digest override for seq {}: {}",
+                    seq,
+                    expected_digest_str
+                );
+            };
+
+            if let Some(local_summary) = checkpoint_store.get_locally_computed_checkpoint(*seq)? {
+                let local_digest = sui_types::message_envelope::Message::digest(&local_summary);
+                if local_digest != expected_digest {
+                    info!(
+                        seq,
+                        local = %Self::get_digest_prefix(local_digest),
+                        expected = %Self::get_digest_prefix(expected_digest),
+                        "Fork recovery: clearing locally_computed_checkpoints from {} due to digest mismatch",
+                        seq
+                    );
+                    checkpoint_store
+                        .clear_locally_computed_checkpoints_from(*seq)
+                        .context(
+                            "Failed to clear locally computed checkpoints from override seq",
+                        )?;
+                }
+            }
+        }
+
+        if let Some((checkpoint_seq, checkpoint_digest)) =
+            checkpoint_store.get_checkpoint_fork_detected()?
+        {
+            if recovery.checkpoint_overrides.contains_key(&checkpoint_seq) {
+                info!(
+                    "Fork recovery enabled: clearing checkpoint fork at seq {} with digest {:?}",
+                    checkpoint_seq, checkpoint_digest
+                );
+                checkpoint_store
+                    .clear_checkpoint_fork_detected()
+                    .expect("Failed to clear checkpoint fork detected marker");
+            }
+        }
+        Ok(())
+    }
+
+    fn try_recover_transaction_fork(
+        checkpoint_store: &CheckpointStore,
+        recovery: &ForkRecoveryConfig,
+    ) -> Result<()> {
+        if recovery.transaction_overrides.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((tx_digest, _, _)) = checkpoint_store.get_transaction_fork_detected()? {
+            if recovery
+                .transaction_overrides
+                .contains_key(&tx_digest.to_string())
+            {
+                info!(
+                    "Fork recovery enabled: clearing transaction fork for tx {:?}",
+                    tx_digest
+                );
+                checkpoint_store
+                    .clear_transaction_fork_detected()
+                    .expect("Failed to clear transaction fork detected marker");
+            }
+        }
+        Ok(())
+    }
+
+    fn get_current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    async fn handle_checkpoint_fork(
+        checkpoint_seq: u64,
+        checkpoint_digest: CheckpointDigest,
+        checkpoint_metrics: &CheckpointMetrics,
+        fork_recovery: Option<&ForkRecoveryConfig>,
+    ) -> Result<()> {
+        checkpoint_metrics
+            .checkpoint_fork_crash_mode
+            .with_label_values(&[
+                &checkpoint_seq.to_string(),
+                &Self::get_digest_prefix(checkpoint_digest),
+                &Self::get_current_timestamp().to_string(),
+            ])
+            .set(1);
+
+        let behavior = fork_recovery
+            .map(|fr| fr.fork_crash_behavior)
+            .unwrap_or_default();
+
+        match behavior {
+            ForkCrashBehavior::AwaitForkRecovery => {
+                error!(
+                    checkpoint_seq = checkpoint_seq,
+                    checkpoint_digest = ?checkpoint_digest,
+                    "Checkpoint fork detected! Node startup halted. Sleeping indefinitely."
+                );
+                futures::future::pending::<()>().await;
+                unreachable!("pending() should never return");
+            }
+            ForkCrashBehavior::ReturnError => {
+                error!(
+                    checkpoint_seq = checkpoint_seq,
+                    checkpoint_digest = ?checkpoint_digest,
+                    "Checkpoint fork detected! Returning error."
+                );
+                Err(anyhow::anyhow!(
+                    "Checkpoint fork detected! checkpoint_seq: {}, checkpoint_digest: {:?}",
+                    checkpoint_seq,
+                    checkpoint_digest
+                ))
+            }
+        }
+    }
+
+    async fn handle_transaction_fork(
+        tx_digest: TransactionDigest,
+        expected_effects_digest: TransactionEffectsDigest,
+        actual_effects_digest: TransactionEffectsDigest,
+        checkpoint_metrics: &CheckpointMetrics,
+        fork_recovery: Option<&ForkRecoveryConfig>,
+    ) -> Result<()> {
+        checkpoint_metrics
+            .transaction_fork_crash_mode
+            .with_label_values(&[
+                &Self::get_digest_prefix(tx_digest),
+                &Self::get_digest_prefix(expected_effects_digest),
+                &Self::get_digest_prefix(actual_effects_digest),
+                &Self::get_current_timestamp().to_string(),
+            ])
+            .set(1);
+
+        let behavior = fork_recovery
+            .map(|fr| fr.fork_crash_behavior)
+            .unwrap_or_default();
+
+        match behavior {
+            ForkCrashBehavior::AwaitForkRecovery => {
+                error!(
+                    tx_digest = ?tx_digest,
+                    expected_effects_digest = ?expected_effects_digest,
+                    actual_effects_digest = ?actual_effects_digest,
+                    "Transaction fork detected! Node startup halted. Sleeping indefinitely."
+                );
+                futures::future::pending::<()>().await;
+                unreachable!("pending() should never return");
+            }
+            ForkCrashBehavior::ReturnError => {
+                error!(
+                    tx_digest = ?tx_digest,
+                    expected_effects_digest = ?expected_effects_digest,
+                    actual_effects_digest = ?actual_effects_digest,
+                    "Transaction fork detected! Returning error."
+                );
+                Err(anyhow::anyhow!(
+                    "Transaction fork detected! tx_digest: {:?}, expected_effects: {:?}, actual_effects: {:?}",
+                    tx_digest, expected_effects_digest, actual_effects_digest
+                ))
+            }
+        }
     }
 }
 
@@ -2233,10 +2485,7 @@ async fn build_http_servers(
     config: &NodeConfig,
     prometheus_registry: &Registry,
     server_version: ServerVersion,
-) -> Result<(
-    HttpServers,
-    Option<tokio::sync::mpsc::Sender<CheckpointData>>,
-)> {
+) -> Result<(HttpServers, Option<tokio::sync::mpsc::Sender<Checkpoint>>)> {
     // Validators do not expose these APIs
     if config.consensus_config().is_some() {
         return Ok((HttpServers::default(), None));
@@ -2414,4 +2663,112 @@ struct HttpServers {
     http: Option<sui_http::ServerHandle>,
     #[allow(unused)]
     https: Option<sui_http::ServerHandle>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::Registry;
+    use std::collections::BTreeMap;
+    use sui_config::node::{ForkCrashBehavior, ForkRecoveryConfig};
+    use sui_core::checkpoints::{CheckpointMetrics, CheckpointStore};
+    use sui_types::digests::{CheckpointDigest, TransactionDigest, TransactionEffectsDigest};
+
+    #[tokio::test]
+    async fn test_fork_error_and_recovery_both_paths() {
+        let checkpoint_store = CheckpointStore::new_for_tests();
+        let checkpoint_metrics = CheckpointMetrics::new(&Registry::new());
+
+        // ---------- Checkpoint fork path ----------
+        let seq_num = 42;
+        let digest = CheckpointDigest::random();
+        checkpoint_store
+            .record_checkpoint_fork_detected(seq_num, digest)
+            .unwrap();
+
+        let fork_recovery = ForkRecoveryConfig {
+            transaction_overrides: Default::default(),
+            checkpoint_overrides: Default::default(),
+            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+        };
+
+        let r = SuiNode::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            true,
+            Some(&fork_recovery),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("Checkpoint fork detected"));
+
+        let mut checkpoint_overrides = BTreeMap::new();
+        checkpoint_overrides.insert(seq_num, digest.to_string());
+        let fork_recovery_with_override = ForkRecoveryConfig {
+            transaction_overrides: Default::default(),
+            checkpoint_overrides,
+            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+        };
+        let r = SuiNode::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            true,
+            Some(&fork_recovery_with_override),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(checkpoint_store
+            .get_checkpoint_fork_detected()
+            .unwrap()
+            .is_none());
+
+        // ---------- Transaction fork path ----------
+        let tx_digest = TransactionDigest::random();
+        let expected_effects = TransactionEffectsDigest::random();
+        let actual_effects = TransactionEffectsDigest::random();
+        checkpoint_store
+            .record_transaction_fork_detected(tx_digest, expected_effects, actual_effects)
+            .unwrap();
+
+        let fork_recovery = ForkRecoveryConfig {
+            transaction_overrides: Default::default(),
+            checkpoint_overrides: Default::default(),
+            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+        };
+        let r = SuiNode::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            true,
+            Some(&fork_recovery),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("Transaction fork detected"));
+
+        let mut transaction_overrides = BTreeMap::new();
+        transaction_overrides.insert(tx_digest.to_string(), actual_effects.to_string());
+        let fork_recovery_with_override = ForkRecoveryConfig {
+            transaction_overrides,
+            checkpoint_overrides: Default::default(),
+            fork_crash_behavior: ForkCrashBehavior::ReturnError,
+        };
+        let r = SuiNode::check_and_recover_forks(
+            &checkpoint_store,
+            &checkpoint_metrics,
+            true,
+            Some(&fork_recovery_with_override),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(checkpoint_store
+            .get_transaction_fork_detected()
+            .unwrap()
+            .is_none());
+    }
 }

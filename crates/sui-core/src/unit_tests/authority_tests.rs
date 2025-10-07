@@ -916,7 +916,7 @@ async fn test_dev_inspect_uses_unbound_object() {
     };
     let kind = TransactionKind::programmable(pt);
 
-    let result = fullnode
+    let err = fullnode
         .dev_inspect_transaction_block(
             sender,
             kind,
@@ -927,9 +927,14 @@ async fn test_dev_inspect_uses_unbound_object() {
             None,
             None,
         )
-        .await;
-    let Err(err) = result else { panic!() };
-    assert!(err.to_string().contains("ObjectNotFound"));
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("Could not find the referenced object"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -1840,11 +1845,14 @@ async fn test_publish_non_existing_dependent_module() {
     );
     let transaction = to_sender_signed_transaction(data, &sender_key);
     let transaction = epoch_store.verify_transaction(transaction).unwrap();
-    let response = authority
+
+    let err = authority
         .handle_transaction(&epoch_store, transaction)
-        .await;
-    assert!(std::string::ToString::to_string(&response.unwrap_err())
-        .contains("DependentPackageNotFound"));
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("Dependent package not found"), "{err}");
     // Check that gas was not charged.
     assert_eq!(
         authority
@@ -2880,7 +2888,7 @@ async fn test_authority_persist() {
     let path = dir.join(format!("DB_{:?}", ObjectID::random()));
     fs::create_dir(&path).unwrap();
 
-    let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(&path, None));
+    let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(&path, None, None));
     // Create an authority
     let store =
         AuthorityStore::open_with_committee_for_testing(perpetual_tables, &committee, &genesis)
@@ -2907,7 +2915,7 @@ async fn test_authority_persist() {
     let seed = [1u8; 32];
     let (genesis, authority_key) = init_state_parameters_from_rng(&mut StdRng::from_seed(seed));
     let committee = genesis.committee().unwrap();
-    let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(&path, None));
+    let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(&path, None, None));
     let store =
         AuthorityStore::open_with_committee_for_testing(perpetual_tables, &committee, &genesis)
             .await
@@ -3314,8 +3322,8 @@ async fn test_transfer_sui_with_amount() {
 }
 
 #[tokio::test]
-async fn test_store_revert_transfer_sui() {
-    // This test checks the correctness of revert_state_update in SuiDataStore.
+async fn test_clear_cache_reverts_transfer_sui() {
+    // This test checks that transfers are reverted after cache is cleared
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let (recipient, _sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_object_id = ObjectID::random();
@@ -3344,7 +3352,6 @@ async fn test_store_revert_transfer_sui() {
     let cache = authority_state.get_object_cache_reader();
     let tx_cache = authority_state.get_transaction_cache_reader();
     let reconfig_api = authority_state.get_reconfig_api();
-    reconfig_api.revert_state_update(&tx_digest);
     reconfig_api
         .clear_state_end_of_epoch(&authority_state.execution_lock_for_reconfiguration().await);
 
@@ -3371,7 +3378,7 @@ fn build_and_commit(
 }
 
 #[tokio::test]
-async fn test_store_revert_wrap_move_call() {
+async fn test_clear_cache_reverts_wrap_move_call() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_object_id = ObjectID::random();
     let (authority_state, object_basics) =
@@ -3416,7 +3423,6 @@ async fn test_store_revert_wrap_move_call() {
     );
 
     let wrap_cert = init_certified_transaction(wrap_txn, &authority_state);
-    let wrap_digest = *wrap_cert.digest();
 
     let wrap_effects = authority_state
         .wait_for_certificate_execution(&wrap_cert, &authority_state.epoch_store_for_testing())
@@ -3432,7 +3438,6 @@ async fn test_store_revert_wrap_move_call() {
 
     let cache = &authority_state.get_object_cache_reader();
     let reconfig_api = authority_state.get_reconfig_api();
-    reconfig_api.revert_state_update(&wrap_digest);
     reconfig_api
         .clear_state_end_of_epoch(&authority_state.execution_lock_for_reconfiguration().await);
 
@@ -3449,7 +3454,7 @@ async fn test_store_revert_wrap_move_call() {
 }
 
 #[tokio::test]
-async fn test_store_revert_unwrap_move_call() {
+async fn test_clear_cache_reverts_unwrap_move_call() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_object_id = ObjectID::random();
     let (authority_state, object_basics) =
@@ -3515,7 +3520,6 @@ async fn test_store_revert_unwrap_move_call() {
     );
 
     let unwrap_cert = init_certified_transaction(unwrap_txn, &authority_state);
-    let unwrap_digest = *unwrap_cert.digest();
 
     let unwrap_effects = authority_state
         .wait_for_certificate_execution(&unwrap_cert, &authority_state.epoch_store_for_testing())
@@ -3531,7 +3535,6 @@ async fn test_store_revert_unwrap_move_call() {
     let cache = &authority_state.get_object_cache_reader();
     let reconfig_api = authority_state.get_reconfig_api();
 
-    reconfig_api.revert_state_update(&unwrap_digest);
     reconfig_api
         .clear_state_end_of_epoch(&authority_state.execution_lock_for_reconfiguration().await);
 
@@ -3723,7 +3726,7 @@ async fn test_dynamic_object_field_address_name_parsing() {
 }
 
 #[tokio::test]
-async fn test_store_revert_add_ofield() {
+async fn test_clear_cache_removes_added_ofield() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_object_id = ObjectID::random();
     let (authority_state, object_basics) =
@@ -3788,7 +3791,6 @@ async fn test_store_revert_add_ofield() {
     );
 
     let add_cert = init_certified_transaction(add_txn, &authority_state);
-    let add_digest = *add_cert.digest();
 
     let add_effects = authority_state
         .wait_for_certificate_execution(&add_cert, &authority_state.epoch_store_for_testing())
@@ -3815,8 +3817,6 @@ async fn test_store_revert_add_ofield() {
     assert_eq!(inner.version(), inner_v1.1);
     assert_eq!(inner.owner, Owner::ObjectOwner(field_v0.0.into()));
 
-    reconfig_api.revert_state_update(&add_digest);
-
     reconfig_api
         .clear_state_end_of_epoch(&authority_state.execution_lock_for_reconfiguration().await);
 
@@ -3832,7 +3832,7 @@ async fn test_store_revert_add_ofield() {
 }
 
 #[tokio::test]
-async fn test_store_revert_remove_ofield() {
+async fn test_clear_cache_reverts_removed_ofield() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_object_id = ObjectID::random();
     let (authority_state, object_basics) =
@@ -3914,7 +3914,6 @@ async fn test_store_revert_remove_ofield() {
     );
 
     let remove_ofield_cert = init_certified_transaction(remove_ofield_txn, &authority_state);
-    let remove_ofield_digest = *remove_ofield_cert.digest();
 
     let remove_effects = authority_state
         .wait_for_certificate_execution(
@@ -3938,7 +3937,6 @@ async fn test_store_revert_remove_ofield() {
     assert_eq!(inner.owner, Owner::AddressOwner(sender));
     assert_eq!(inner.version(), inner_v2.1);
 
-    reconfig_api.revert_state_update(&remove_ofield_digest);
     reconfig_api
         .clear_state_end_of_epoch(&authority_state.execution_lock_for_reconfiguration().await);
 
@@ -6614,7 +6612,7 @@ async fn test_consensus_handler_congestion_control_transaction_cancellation() {
                 SequenceNumber::CANCELLED_READ
             )
         ],
-        shared_object_version
+        shared_object_version.shared_object_versions
     );
 
     // Load shared objects.
@@ -6759,4 +6757,81 @@ async fn test_insufficient_balance_for_withdraw_early_error() {
     } else {
         panic!("Expected execution status to be Failure");
     }
+}
+
+#[tokio::test]
+async fn test_should_wait_for_dependency_object() {
+    let (sender, _keypair): (_, AccountKeyPair) = get_key_pair();
+    let authority_state = TestAuthorityBuilder::new().build().await;
+
+    // Test case: Object doesn't exist yet - should wait
+    let non_existent_obj_id = ObjectID::random();
+    let non_existent_obj_ref = (
+        non_existent_obj_id,
+        OBJECT_START_VERSION,
+        ObjectDigest::random(),
+    );
+    let result = authority_state
+        .should_wait_for_dependency_object(non_existent_obj_ref)
+        .unwrap();
+    if let InputKey::VersionedObject {
+        id: full_obj_id,
+        version,
+    } = result
+    {
+        assert_eq!(full_obj_id.id(), non_existent_obj_id);
+        assert_eq!(version, OBJECT_START_VERSION);
+    } else {
+        panic!("Expected Some(InputKey::VersionedObject)");
+    }
+
+    // Set up a test object a test object.
+    let test_obj_id = ObjectID::random();
+    let test_object = Object::with_id_owner_for_testing(test_obj_id, sender);
+    let current_version = test_object.version();
+    let current_ref = test_object.compute_object_reference();
+    authority_state
+        .insert_genesis_object(test_object.clone())
+        .await;
+
+    // Test case: Current version - should not wait
+    let result = authority_state.should_wait_for_dependency_object(current_ref);
+    assert!(result.is_none(), "Should not wait for current version");
+
+    // Test case: Older version - should not wait
+    let older_version = SequenceNumber::from_u64(current_version.value() - 1);
+    let older_ref = (test_obj_id, older_version, ObjectDigest::random());
+    let result = authority_state.should_wait_for_dependency_object(older_ref);
+    assert!(result.is_none(), "Should not wait for older version");
+
+    // Test case: Request future version - should wait
+    let future_version = SequenceNumber::from_u64(current_version.value() + 1);
+    let future_ref = (test_obj_id, future_version, ObjectDigest::random());
+    let result = authority_state
+        .should_wait_for_dependency_object(future_ref)
+        .unwrap();
+    if let InputKey::VersionedObject {
+        id: full_obj_id,
+        version,
+    } = result
+    {
+        assert_eq!(full_obj_id.id(), test_obj_id);
+        assert_eq!(version, future_version);
+    } else {
+        panic!("Expected InputKey::VersionedObject");
+    }
+
+    // Test case: Deleted object - should not wait
+    let deleted_obj_id = ObjectID::random();
+    let deleted_obj_ref = (
+        deleted_obj_id,
+        OBJECT_START_VERSION,
+        ObjectDigest::OBJECT_DIGEST_DELETED,
+    );
+    let deleted_obj = Object::with_id_owner_for_testing(deleted_obj_id, sender);
+    authority_state
+        .insert_genesis_object(deleted_obj.clone())
+        .await;
+    let result = authority_state.should_wait_for_dependency_object(deleted_obj_ref);
+    assert!(result.is_none(), "Should not wait for deleted object");
 }

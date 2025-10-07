@@ -1,11 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use async_graphql::{Context, Enum, Object, SimpleObject, Union};
+use anyhow::Context as _;
+use async_graphql::{dataloader::DataLoader, Context, Enum, Object, SimpleObject, Union};
+use std::sync::Arc;
+use sui_indexer_alt_reader::{epochs::EpochStartKey, pg_reader::PgReader};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::ObjectDigest,
-    effects::UnchangedSharedKind as NativeUnchangedSharedKind,
+    effects::UnchangedConsensusKind as NativeUnchangedConsensusKind,
 };
 
 use crate::{
@@ -14,10 +17,7 @@ use crate::{
     scope::Scope,
 };
 
-use super::{
-    address::Address,
-    object::{self, Object},
-};
+use super::object::Object;
 
 /// Reason why a transaction that attempted to access a consensus-managed object was cancelled.
 #[derive(Enum, Copy, Clone, Eq, PartialEq)]
@@ -83,15 +83,24 @@ pub(crate) struct ConsensusObjectCancelled {
 pub(crate) struct PerEpochConfig {
     scope: Scope,
     object_id: ObjectID,
-    /// The checkpoint when the transaction was executed (not the current view checkpoint)
-    execution_checkpoint: u64,
+    /// The epoch when the transaction was executed
+    epoch: u64,
 }
 
 #[Object]
 impl PerEpochConfig {
-    /// The per-epoch configuration object as of the checkpoint when the transaction was executed.
-    async fn object(&self, ctx: &Context<'_>) -> Result<Option<Object>, RpcError<object::Error>> {
-        let cp: UInt53 = self.execution_checkpoint.into();
+    /// The per-epoch configuration object as of when the transaction was executed.
+    async fn object(&self, ctx: &Context<'_>) -> Result<Option<Object>, RpcError> {
+        let pg_loader: &Arc<DataLoader<PgReader>> = ctx.data()?;
+        let Some(epoch_start) = pg_loader
+            .load_one(EpochStartKey(self.epoch))
+            .await
+            .context("Failed to fetch epoch start information")?
+        else {
+            return Ok(None);
+        };
+
+        let cp: UInt53 = (epoch_start.cp_lo as u64).into();
         Object::checkpoint_bounded(ctx, self.scope.clone(), self.object_id.into(), cp).await
     }
 }
@@ -100,21 +109,25 @@ impl PerEpochConfig {
 impl ConsensusObjectRead {
     /// The version of the consensus-managed object that was read by this transaction.
     async fn object(&self) -> Option<Object> {
-        let address = Address::with_address(self.scope.clone(), self.object_id.into());
-        Some(Object::with_ref(address, self.version, self.digest))
+        Some(Object::with_ref(
+            &self.scope,
+            self.object_id.into(),
+            self.version,
+            self.digest,
+        ))
     }
 }
 
 impl UnchangedConsensusObject {
     pub(crate) fn from_native(
         scope: Scope,
-        native: (ObjectID, NativeUnchangedSharedKind),
-        execution_checkpoint: u64,
+        native: (ObjectID, NativeUnchangedConsensusKind),
+        epoch: u64,
     ) -> Self {
         let (object_id, kind) = native;
 
         match kind {
-            NativeUnchangedSharedKind::ReadOnlyRoot((version, digest)) => {
+            NativeUnchangedConsensusKind::ReadOnlyRoot((version, digest)) => {
                 Self::Read(ConsensusObjectRead {
                     scope,
                     object_id,
@@ -122,19 +135,19 @@ impl UnchangedConsensusObject {
                     digest,
                 })
             }
-            NativeUnchangedSharedKind::MutateConsensusStreamEnded(sequence_number) => {
+            NativeUnchangedConsensusKind::MutateConsensusStreamEnded(sequence_number) => {
                 Self::MutateConsensusStreamEnded(MutateConsensusStreamEnded {
                     address: Some(object_id.into()),
                     sequence_number: Some(sequence_number.into()),
                 })
             }
-            NativeUnchangedSharedKind::ReadConsensusStreamEnded(sequence_number) => {
+            NativeUnchangedConsensusKind::ReadConsensusStreamEnded(sequence_number) => {
                 Self::ReadConsensusStreamEnded(ReadConsensusStreamEnded {
                     address: Some(object_id.into()),
                     sequence_number: Some(sequence_number.into()),
                 })
             }
-            NativeUnchangedSharedKind::Cancelled(sequence_number) => {
+            NativeUnchangedConsensusKind::Cancelled(sequence_number) => {
                 let cancellation_reason = match sequence_number {
                     SequenceNumber::CANCELLED_READ => {
                         ConsensusObjectCancellationReason::CancelledRead
@@ -150,10 +163,10 @@ impl UnchangedConsensusObject {
                     cancellation_reason: Some(cancellation_reason),
                 })
             }
-            NativeUnchangedSharedKind::PerEpochConfig => Self::PerEpochConfig(PerEpochConfig {
+            NativeUnchangedConsensusKind::PerEpochConfig => Self::PerEpochConfig(PerEpochConfig {
                 scope,
                 object_id,
-                execution_checkpoint,
+                epoch,
             }),
         }
     }

@@ -62,6 +62,7 @@ pub struct ExecutionCacheTraitPointers {
     pub transaction_cache_reader: Arc<dyn TransactionCacheRead>,
     pub cache_writer: Arc<dyn ExecutionCacheWrite>,
     pub backing_store: Arc<dyn BackingStore + Send + Sync>,
+    pub child_object_resolver: Arc<dyn ChildObjectResolver + Send + Sync>,
     pub backing_package_store: Arc<dyn BackingPackageStore + Send + Sync>,
     pub object_store: Arc<dyn ObjectStore + Send + Sync>,
     pub reconfig_api: Arc<dyn ExecutionCacheReconfigAPI>,
@@ -94,6 +95,7 @@ impl ExecutionCacheTraitPointers {
             transaction_cache_reader: cache.clone(),
             cache_writer: cache.clone(),
             backing_store: cache.clone(),
+            child_object_resolver: cache.clone(),
             backing_package_store: cache.clone(),
             object_store: cache.clone(),
             reconfig_api: cache.clone(),
@@ -517,6 +519,11 @@ pub trait TransactionCacheRead: Send + Sync {
             .expect("multi-get must return correct number of items")
     }
 
+    fn get_unchanged_loaded_runtime_objects(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Option<Vec<ObjectKey>>;
+
     fn take_accumulator_events(&self, digest: &TransactionDigest) -> Option<Vec<AccumulatorEvent>>;
 
     fn notify_read_executed_effects_digests<'a>(
@@ -634,7 +641,6 @@ pub trait ExecutionCacheReconfigAPI: Send + Sync {
     fn insert_genesis_object(&self, object: Object);
     fn bulk_insert_genesis_objects(&self, objects: &[Object]);
 
-    fn revert_state_update(&self, digest: &TransactionDigest);
     fn set_epoch_start_configuration(&self, epoch_start_config: &EpochStartConfiguration);
 
     fn update_epoch_flags_metrics(&self, old: &[EpochFlag], new: &[EpochFlag]);
@@ -823,10 +829,6 @@ macro_rules! implement_passthrough_traits {
 
             fn bulk_insert_genesis_objects(&self, objects: &[Object]) {
                 self.bulk_insert_genesis_objects_impl(objects)
-            }
-
-            fn revert_state_update(&self, digest: &TransactionDigest) {
-                self.revert_state_update_impl(digest)
             }
 
             fn set_epoch_start_configuration(&self, epoch_start_config: &EpochStartConfiguration) {

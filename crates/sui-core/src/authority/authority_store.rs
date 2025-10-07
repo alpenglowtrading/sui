@@ -332,6 +332,15 @@ impl AuthorityStore {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn get_unchanged_loaded_runtime_objects(
+        &self,
+        digest: &TransactionDigest,
+    ) -> Result<Option<Vec<ObjectKey>>, TypedStoreError> {
+        self.perpetual_tables
+            .unchanged_loaded_runtime_objects
+            .get(digest)
+    }
+
     pub fn multi_get_effects<'a>(
         &self,
         effects_digests: impl Iterator<Item = &'a TransactionEffectsDigest>,
@@ -648,6 +657,8 @@ impl AuthorityStore {
     ) -> SuiResult<()> {
         let mut hasher = Sha3_256::default();
         let mut batch = perpetual_db.objects.batch();
+        let mut written = 0usize;
+        const MAX_BATCH_SIZE: usize = 100_000;
         for object in live_objects {
             hasher.update(object.object_reference().2.inner());
             match object {
@@ -678,6 +689,12 @@ impl AuthorityStore {
                         )),
                     )?;
                 }
+            }
+            written += 1;
+            if written > MAX_BATCH_SIZE {
+                batch.write()?;
+                batch = perpetual_db.objects.batch();
+                written = 0;
             }
         }
         let sha3_digest = hasher.finalize().digest;
@@ -755,13 +772,27 @@ impl AuthorityStore {
             deleted,
             written,
             events,
+            unchanged_loaded_runtime_objects,
             locks_to_delete,
             new_locks_to_init,
             ..
         } = tx_outputs;
 
-        // Store the certificate indexed by transaction digest
+        let effects_digest = effects.digest();
         let transaction_digest = transaction.digest();
+        // effects must be inserted before the corresponding dependent entries
+        // because they carry epoch information necessary for correct pruning via relocation filters
+        write_batch
+            .insert_batch(
+                &self.perpetual_tables.effects,
+                [(effects_digest, effects.clone())],
+            )?
+            .insert_batch(
+                &self.perpetual_tables.executed_effects,
+                [(transaction_digest, effects_digest)],
+            )?;
+
+        // Store the certificate indexed by transaction digest
         write_batch.insert_batch(
             &self.perpetual_tables.transactions,
             iter::once((transaction_digest, transaction.serializable_ref())),
@@ -801,22 +832,19 @@ impl AuthorityStore {
             )?;
         }
 
+        // Write unchanged_loaded_runtime_objects
+        if !unchanged_loaded_runtime_objects.is_empty() {
+            write_batch.insert_batch(
+                &self.perpetual_tables.unchanged_loaded_runtime_objects,
+                [(transaction_digest, unchanged_loaded_runtime_objects)],
+            )?;
+        }
+
         self.initialize_live_object_markers_impl(write_batch, new_locks_to_init, false)?;
 
         // Note: deletes locks for received objects as well (but not for objects that were in
         // `Receiving` arguments which were not received)
         self.delete_live_object_markers(write_batch, locks_to_delete)?;
-
-        let effects_digest = effects.digest();
-        write_batch
-            .insert_batch(
-                &self.perpetual_tables.effects,
-                [(effects_digest, effects.clone())],
-            )?
-            .insert_batch(
-                &self.perpetual_tables.executed_effects,
-                [(transaction_digest, effects_digest)],
-            )?;
 
         debug!(effects_digest = ?effects.digest(), "commit_certificate finished");
 
@@ -1101,103 +1129,6 @@ impl AuthorityStore {
         batch.write().unwrap();
     }
 
-    /// This function is called at the end of epoch for each transaction that's
-    /// executed locally on the validator but didn't make to the last checkpoint.
-    /// The effects of the execution is reverted here.
-    /// The following things are reverted:
-    /// 1. All new object states are deleted.
-    /// 2. owner_index table change is reverted.
-    ///
-    /// NOTE: transaction and effects are intentionally not deleted. It's
-    /// possible that if this node is behind, the network will execute the
-    /// transaction in a later epoch. In that case, we need to keep it saved
-    /// so that when we receive the checkpoint that includes it from state
-    /// sync, we are able to execute the checkpoint.
-    /// TODO: implement GC for transactions that are no longer needed.
-    pub fn revert_state_update(&self, tx_digest: &TransactionDigest) -> SuiResult {
-        let Some(effects) = self.get_executed_effects(tx_digest)? else {
-            info!("Not reverting {:?} as it was not executed", tx_digest);
-            return Ok(());
-        };
-
-        info!(?tx_digest, ?effects, "reverting transaction");
-
-        // We should never be reverting shared object transactions.
-        assert!(effects.input_shared_objects().is_empty());
-
-        let mut write_batch = self.perpetual_tables.transactions.batch();
-        write_batch.delete_batch(
-            &self.perpetual_tables.executed_effects,
-            iter::once(tx_digest),
-        )?;
-        if effects.events_digest().is_some() {
-            write_batch.delete_batch(&self.perpetual_tables.events_2, [tx_digest])?;
-        }
-
-        let tombstones = effects
-            .all_tombstones()
-            .into_iter()
-            .map(|(id, version)| ObjectKey(id, version));
-        write_batch.delete_batch(&self.perpetual_tables.objects, tombstones)?;
-
-        let all_new_object_keys = effects
-            .all_changed_objects()
-            .into_iter()
-            .map(|((id, version, _), _, _)| ObjectKey(id, version));
-        write_batch.delete_batch(&self.perpetual_tables.objects, all_new_object_keys.clone())?;
-
-        let modified_object_keys = effects
-            .modified_at_versions()
-            .into_iter()
-            .map(|(id, version)| ObjectKey(id, version));
-
-        macro_rules! get_objects_and_locks {
-            ($object_keys: expr) => {
-                self.perpetual_tables
-                    .objects
-                    .multi_get($object_keys.clone())?
-                    .into_iter()
-                    .zip($object_keys)
-                    .filter_map(|(obj_opt, key)| {
-                        let obj = self
-                            .perpetual_tables
-                            .object(
-                                &key,
-                                obj_opt.unwrap_or_else(|| {
-                                    panic!("Older object version not found: {:?}", key)
-                                }),
-                            )
-                            .expect("Matching indirect object not found")?;
-
-                        if obj.is_immutable() {
-                            return None;
-                        }
-
-                        let obj_ref = obj.compute_object_reference();
-                        Some(obj.is_address_owned().then_some(obj_ref))
-                    })
-            };
-        }
-
-        let old_locks = get_objects_and_locks!(modified_object_keys);
-        let new_locks = get_objects_and_locks!(all_new_object_keys);
-
-        let old_locks: Vec<_> = old_locks.flatten().collect();
-
-        // Re-create old locks.
-        self.initialize_live_object_markers_impl(&mut write_batch, &old_locks, true)?;
-
-        // Delete new locks
-        write_batch.delete_batch(
-            &self.perpetual_tables.live_owned_object_markers,
-            new_locks.flatten(),
-        )?;
-
-        write_batch.write()?;
-
-        Ok(())
-    }
-
     /// Return the object with version less then or eq to the provided seq number.
     /// This is used by indexer to find the correct version of dynamic field child object.
     /// We do not store the version of the child object, but because of lamport timestamp,
@@ -1275,14 +1206,16 @@ impl AuthorityStore {
         transaction_effects: &TransactionEffects,
     ) -> Result<(), TypedStoreError> {
         let mut write_batch = self.perpetual_tables.transactions.batch();
+        // effects must be inserted before the corresponding transaction entry
+        // because they carry epoch information necessary for correct pruning via relocation filters
         write_batch
-            .insert_batch(
-                &self.perpetual_tables.transactions,
-                [(transaction.digest(), transaction.serializable_ref())],
-            )?
             .insert_batch(
                 &self.perpetual_tables.effects,
                 [(transaction_effects.digest(), transaction_effects)],
+            )?
+            .insert_batch(
+                &self.perpetual_tables.transactions,
+                [(transaction.digest(), transaction.serializable_ref())],
             )?;
 
         write_batch.write()?;
@@ -1297,12 +1230,12 @@ impl AuthorityStore {
         for tx in transactions {
             write_batch
                 .insert_batch(
-                    &self.perpetual_tables.transactions,
-                    [(tx.transaction.digest(), tx.transaction.serializable_ref())],
-                )?
-                .insert_batch(
                     &self.perpetual_tables.effects,
                     [(tx.effects.digest(), &tx.effects)],
+                )?
+                .insert_batch(
+                    &self.perpetual_tables.transactions,
+                    [(tx.transaction.digest(), tx.transaction.serializable_ref())],
                 )?;
         }
 

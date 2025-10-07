@@ -7,29 +7,27 @@ description: Overview of the design aspects of Nautilus, including its trust mod
 
 ## dApp developer actions
 
-1. Create a Nautilus off-chain server with a reproducible build. You have the option of using the [provided template](https://github.com/MystenLabs/nautilus).
-2. Publish the server code to a public repository (such as GitHub) to ensure transparency and verifiability.
-3. Register the instance’s platform configuration registers (PCRs) using a Sui smart contract.
+1. Create a Nautilus off-chain server with a reproducible build using the [provided template](https://github.com/MystenLabs/nautilus).
+2. Publish the server code to a public repository like GitHub to ensure transparency and verifiability.
+3. Register the instance's platform configuration registers (PCRs) - measurements of the trusted computing base - using a Sui smart contract.
 4. Deploy the server to an AWS Nitro Enclave.
-5. Register the deployed enclave using a Sui smart contract and the attestation document. This step also includes registering the enclave’s public key, which is an ephemeral key securely generated within the enclave for signing the enclave responses.
+5. Register the deployed enclave using a Sui smart contract and attestation document, including the enclave's ephemeral public key for signing responses.
 
 To reduce the trusted computing base, you should route access to the enclave through backend services that handle load balancing, rate limiting, and other related aspects.
 
 :::tip
-
-Verifying an attestation document on chain is a relatively expensive operation that you should perform only during enclave registration. After registration, use the enclave key to more efficiently verify messages from the enclave.
-
+Verify attestation documents on-chain only during enclave registration due to high gas costs. After registration, use the enclave key for more efficient message verification.
 :::
 
 ## dApp user / client actions
 
-1. (Optional) Verify the Nautilus off-chain server code by building it locally and confirming that the generated PCRs match the onchain records.
+1. (Optional) Verify the Nautilus off-chain server code by building it locally and confirming that the generated PCRs match the on-chain records.
 2. Send a request to the deployed enclave and receive a signed response.
 3. Submit the signed response on chain for verification before executing the corresponding application logic.
 
 ## Trust model
 
-The attestation document from an AWS Nitro Enclave includes a certificate chain that can be verified on chain using AWS as the root certificate authority. This verification confirms the following:
+The attestation document from an AWS Nitro Enclave includes a certificate chain that can be verified on-chain using AWS as the root certificate authority. This verification confirms the following:
 
 - The enclave instance is running unmodified software, as validated by its PCR values.
 - Users can independently verify that the instance’s computation aligns with the published source code, ensuring transparency and trust.
@@ -45,3 +43,13 @@ Reproducible builds allow builders and users to optionally verify that the binar
 Reproducible builds might not apply to all use cases, such as when the source code is not public.
 
 :::
+
+### TEE security considerations
+
+Nautilus uses cloud-based enclaves designed to protect against software-level attacks. The focus on cloud-hosted TEEs, like AWS Nitro Enclaves, is intentional for the following reasons:
+
+- **Cloud providers respond quickly to vulnerabilities**. They receive early signals about security issues and can patch them efficiently.
+- **They maintain strong physical security**. Access to cloud data centers is tightly controlled, reducing the risk of physical hardware attacks.
+- **They operate under strict compliance standards**. Providers like AWS and GCP are regularly audited against frameworks like SOC 2, ISO 27001, CSA STAR, and so on, ensuring operational integrity.
+
+You are encouraged to evaluate whether this trust model aligns with your application’s threat profile and security needs.
